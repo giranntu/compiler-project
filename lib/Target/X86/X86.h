@@ -86,6 +86,11 @@ FunctionPass *createX86ExpandPseudoPass();
 /// the upper portions of registers, and to save code size.
 FunctionPass *createX86FixupBWInsts();
 
+/// Return a Machine IR pass that leverages cross-procedure register liveness
+/// analysis and callee register renaming to eliminate register spillings and
+/// restorings in function prologues and epilogues.
+FunctionPass *createX86CallSpillEliPass();
+
 void initializeFixupBWInstPassPass(PassRegistry &);
 } // End llvm namespace
 
