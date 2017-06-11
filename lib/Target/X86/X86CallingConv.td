@@ -853,7 +853,7 @@ def CC_X86 : CallingConv<[
 def CSR_NoRegs : CalleeSavedRegs<(add)>;
 
 def CSR_32 : CalleeSavedRegs<(add ESI, EDI, EBX, EBP)>;
-def CSR_64 : CalleeSavedRegs<(add RBX, R12, R13, R14, R15, RBP)>;
+def CSR_64 : CalleeSavedRegs<(add RBX, R12, R13, R14, R15, RBP, RBX, R10, R11)>;
 
 def CSR_64_SwiftError : CalleeSavedRegs<(sub CSR_64, R12)>;
 
