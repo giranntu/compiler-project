@@ -255,6 +255,7 @@ public:
   }
 
   void addIRPasses() override;
+  void addCodeGenPrepare() override;
   bool addInstSelector() override;
   bool addILPOpts() override;
   bool addPreISel() override;
@@ -273,6 +274,12 @@ void X86PassConfig::addIRPasses() {
   addPass(createAtomicExpandPass(&getX86TargetMachine()));
 
   TargetPassConfig::addIRPasses();
+}
+
+void X86PassConfig::addCodeGenPrepare() {
+  addPass(createTopdownFunctionReorderPass());
+
+  TargetPassConfig::addCodeGenPrepare();
 }
 
 bool X86PassConfig::addInstSelector() {

@@ -19,10 +19,16 @@
 
 namespace llvm {
 
+class ModulePass;
 class FunctionPass;
 class ImmutablePass;
 class PassRegistry;
 class X86TargetMachine;
+
+/// This pass orders functions in a module to the DFS traversal order of
+/// the call graph for the preparation of the call spills eliminator, which
+/// works with a top-down approach.
+ModulePass *createTopdownFunctionReorderPass();
 
 /// This pass converts a legalized DAG into a X86-specific DAG, ready for
 /// instruction scheduling.

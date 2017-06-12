@@ -2,9 +2,13 @@
 #include "X86InstrInfo.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
+#include "llvm/ADT/DepthFirstIterator.h"
+#include "llvm/Analysis/CallGraph.h"
 #include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
+#include "llvm/CodeGen/MachineFunctionAnalysis.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
+#include "llvm/Pass.h"
 #include "llvm/Support/Debug.h"
 using namespace llvm;
 using namespace std;
@@ -16,6 +20,19 @@ STATISTIC(NumRegRenamed, "Number of register renamed in callee");
 STATISTIC(NumVersionAdded, "Number of additional versions of functions");
 
 namespace {
+/// A pass to reorder functions in a module to make it the DFS
+/// traversal order of the call graph.
+struct FunctionReorderPass : public ModulePass {
+  static char ID;
+  FunctionReorderPass() : ModulePass(ID) {}
+
+  void getAnalysisUsage(AnalysisUsage &AU) const override {
+    AU.addRequired<CallGraphWrapperPass>();
+  }
+
+  bool runOnModule(Module &) override;
+};
+
 struct CallSpillEli : public MachineFunctionPass {
   static char ID;
   CallSpillEli() : MachineFunctionPass(ID) {}
@@ -47,12 +64,71 @@ private:
                     vector<CalleeSavedInstr> &);
 };
 
+char FunctionReorderPass::ID = 0;
 char CallSpillEli::ID = 0;
 } // namespace
 
+ModulePass *llvm::createTopdownFunctionReorderPass() { return new FunctionReorderPass(); }
 FunctionPass *llvm::createX86CallSpillEliPass() { return new CallSpillEli(); }
 
+bool FunctionReorderPass::runOnModule(Module &M) {
+  CallGraph &CG = getAnalysis<CallGraphWrapperPass>().getCallGraph();
+  Module::FunctionListType &FunctionList = M.getFunctionList();
+
+  // Sort functions in DFS order. Instead of directly modifying the
+  // function list, the result order is stored in a vector because
+  // the modification may break the loop iteration.
+  vector<Function *> FunctionOrder;
+  FunctionOrder.reserve(FunctionList.size());
+  for (auto Node : depth_first(&CG)) {
+    // Don't count external functions, which are those returning nullptr.
+    if (Function *F = Node->getFunction()) {
+      FunctionOrder.push_back(F);
+    }
+  }
+  assert(FunctionOrder.size() == FunctionList.size());
+
+  // Adjust order of functions in FunctionList.
+  for (Function *F : FunctionOrder) {
+    FunctionList.remove(F);
+    FunctionList.push_back(F);
+  }
+
+  return true;
+}
+
 bool CallSpillEli::runOnMachineFunction(MachineFunction &MF) {
+  MachineFunctionAnalysis &MFA = getAnalysis<MachineFunctionAnalysis>();
+  const Function *F = MF.getFunction();
+
+  // Require callers of the function to be determinable, and abort if not.
+  // Thatis, it cannot have either external linkage (may be called from
+  // other modules) or address taken (may be called indirectly).
+  if (F->hasAddressTaken() || !F->hasLocalLinkage()) {
+    DEBUG(dbgs() << "Callers of function '" << MF.getName() << "' are not "
+                 << "trackable because either it has external linkage or it "
+                 << "might be called indirectly (it has its address taken). "
+                 << "Aborted.\n");
+    return false;
+  }
+
+  // Require the function to has only one caller. Currently abort if not.
+  // TODO: It shall be able to analysis register usage of all callers.
+  if (F->getNumUses() != 1) {
+    DEBUG(dbgs() << "Function '" << MF.getName() << "' has either zero or "
+                 << "more than one callers which is currently not supported. "
+                 << "Aborted.\n");
+    return false;
+  }
+
+  // Require all callers' register allocation to be done. Abort if not.
+  if (!all_of(F->users(), [&](const User *U) {
+              return MFA.getMFOf(cast<Instruction>(U)->getFunction()); })) {
+    DEBUG(dbgs() << "Register allocation for some callers of function '"
+                 << MF.getName() << "' are not yet done. Aborted\n");
+    return false;
+  }
+
   SmallVector<MachineBasicBlock *, 4> SaveBBs, RestoreBBs;
   vector<CalleeSavedInstr> CSInstrs;
 
