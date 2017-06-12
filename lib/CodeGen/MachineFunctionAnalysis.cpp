@@ -26,11 +26,6 @@ MachineFunctionAnalysis::MachineFunctionAnalysis(
   initializeMachineModuleInfoPass(*PassRegistry::getPassRegistry());
 }
 
-MachineFunctionAnalysis::~MachineFunctionAnalysis() {
-  releaseMemory();
-  assert(!MF && "MachineFunctionAnalysis left initialized!");
-}
-
 void MachineFunctionAnalysis::getAnalysisUsage(AnalysisUsage &AU) const {
   AU.setPreservesAll();
   AU.addRequired<MachineModuleInfo>();
@@ -46,15 +41,15 @@ bool MachineFunctionAnalysis::doInitialization(Module &M) {
 
 
 bool MachineFunctionAnalysis::runOnFunction(Function &F) {
-  assert(!MF && "MachineFunctionAnalysis already initialized!");
   MF = new MachineFunction(&F, TM, NextFnNum++,
                            getAnalysis<MachineModuleInfo>());
   if (MFInitializer)
     MFInitializer->initializeMachineFunction(*MF);
+
+  MFDatabase[&F] = MF;
   return false;
 }
 
 void MachineFunctionAnalysis::releaseMemory() {
-  delete MF;
   MF = nullptr;
 }

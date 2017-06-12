@@ -15,6 +15,7 @@
 #define LLVM_CODEGEN_MACHINEFUNCTIONANALYSIS_H
 
 #include "llvm/Pass.h"
+#include "llvm/ADT/DenseMap.h"
 
 namespace llvm {
 
@@ -30,14 +31,21 @@ private:
   MachineFunction *MF;
   unsigned NextFnNum;
   MachineFunctionInitializer *MFInitializer;
+  DenseMap<const Function *, const MachineFunction *> MFDatabase;
 
 public:
   static char ID;
   explicit MachineFunctionAnalysis(const TargetMachine &tm,
                                    MachineFunctionInitializer *MFInitializer);
-  ~MachineFunctionAnalysis() override;
 
   MachineFunction &getMF() const { return *MF; }
+
+  /// Lookup \p the MachineFunction of \p F managed by the same instance of
+  /// this pass. If \p is not yet transformed to a MachineForm or not
+  /// processed by the pass instance, this method returns nullptr.
+  const MachineFunction *getMFOf(const Function *F) const {
+    return MFDatabase.lookup(F);
+  }
 
   const char* getPassName() const override {
     return "Machine Function Analysis";
