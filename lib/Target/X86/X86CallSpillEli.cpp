@@ -1,6 +1,7 @@
 #include "X86.h"
 #include "X86InstrInfo.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/DepthFirstIterator.h"
 #include "llvm/Analysis/CallGraph.h"
@@ -62,6 +63,13 @@ private:
                     const SmallVectorImpl<MachineBasicBlock *> &SaveBBs,
                     const SmallVectorImpl<MachineBasicBlock *> &RestoreBBs,
                     vector<CalleeSavedInstr> &) const;
+
+  /// Find callers of the machine function <Of>. The result machine instructions
+  /// are stored in <Callers>. It returns false if the MachineFunction of any
+  /// caller is still unavailable.
+  bool findCallers(const MachineFunction &Of,
+                   const MachineFunctionAnalysis &,
+                   SmallVectorImpl<const MachineInstr *> &Callers) const;
 };
 
 char FunctionReorderPass::ID = 0;
@@ -220,4 +228,37 @@ void CallSpillEli::findCSInstrs(
 
     CSInstrs.emplace_back(move(CSInstr));
   }
+}
+
+bool CallSpillEli::findCallers(
+    const MachineFunction &MF, const MachineFunctionAnalysis &MFAnalysis,
+    SmallVectorImpl<const MachineInstr *> &Results) const {
+  DenseSet<const Function *> Searched;
+  const Function *F = MF.getFunction();
+
+  Results.clear();
+  for (const User *U : F->users()) {
+    const Function *CallerFn = cast<Instruction>(U)->getFunction();
+
+    // There may be multiple callers in one function.
+    // Skip searched functions.
+    if (!Searched.insert(CallerFn).second) {
+      continue;
+    }
+
+    if (const MachineFunction *MF = MFAnalysis.getMFOf(CallerFn)) {
+      for (auto &MBB : *MF) {
+        for (auto &MInstr : MBB) {
+          if (MInstr.isCall() && MInstr.getOperand(0).getGlobal() == F) {
+            Results.push_back(&MInstr);
+          }
+        }
+      }
+    } else {
+      return false;
+    }
+  }
+
+  assert(Results.size() == F->getNumUses());
+  return true;
 }
