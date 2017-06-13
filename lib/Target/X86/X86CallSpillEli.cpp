@@ -17,6 +17,7 @@ using namespace std;
 #define DEBUG_TYPE "x86-eliminate-call-spill"
 
 STATISTIC(NumSpillEliminated, "Number of register spills eliminated");
+STATISTIC(NumMInstEliminated, "Number of instructions eliminated");
 STATISTIC(NumRegRenamed, "Number of register renamed in callee");
 STATISTIC(NumVersionAdded, "Number of additional versions of functions");
 
@@ -70,6 +71,9 @@ private:
   bool findCallers(const MachineFunction &Of,
                    const MachineFunctionAnalysis &,
                    SmallVectorImpl<const MachineInstr *> &Callers) const;
+
+  /// Discard saving/restoring the specified callee-saved register.
+  void discardRegSave(CalleeSavedInstr &) const;
 };
 
 char FunctionReorderPass::ID = 0;
@@ -149,6 +153,27 @@ bool CallSpillEli::runOnMachineFunction(MachineFunction &MF) {
     DEBUG(dbgs() << "Function '" << MF.getName() << "' does not save/restore "
                  << "any callee-saved register. Aborted.\n");
     return false;
+  }
+
+  // TODO: Currently it only supports one caller. However, following code
+  // need modification to support multiple callers.
+  const MachineInstr *TheCaller = Callers.front();
+  const MachineBasicBlock *CallerBB = TheCaller->getParent();
+  const TargetRegisterInfo *RegInfo = MF.getRegInfo().getTargetRegisterInfo();
+
+  for (CalleeSavedInstr &CSI : CSInstrs) {
+    // The utility 'computeRegisterLiveness' can give information about register
+    // liveness. It performs linear search on previous and next few instructions
+    // of the specified instruction, so there is chance to get uncertain replies.
+    // Adjust the last (hidden) argument of this utility to give more chance to
+    // find dead registers.
+    if (CallerBB->computeRegisterLiveness(RegInfo, CSI.Info.getReg(), TheCaller) ==
+        MachineBasicBlock::LQR_Dead) {
+      DEBUG(dbgs() << "Callee-saved register <" << RegInfo->getName(CSI.Info.getReg())
+                   << "> is discarded to spill in function '" << MF.getName()
+                   << "' because it is originally dead in the caller.\n");
+      discardRegSave(CSI);
+    }
   }
 
   return false;
@@ -261,4 +286,15 @@ bool CallSpillEli::findCallers(
 
   assert(Results.size() == F->getNumUses());
   return true;
+}
+
+void CallSpillEli::discardRegSave(CalleeSavedInstr &CSI) const {
+  ++NumSpillEliminated;
+
+  for (auto &PushPops : { CSI.PushInstrs, CSI.PopInstrs }) {
+    for (MachineInstr *MInstr : PushPops) {
+      MInstr->eraseFromParent();
+      ++NumMInstEliminated;
+    }
+  }
 }
