@@ -55,13 +55,13 @@ private:
   /// Find save and restore blocks in the machine function.
   void findSaveRestoreBBs(MachineFunction &,
                           SmallVectorImpl<MachineBasicBlock *> &SaveBBs,
-                          SmallVectorImpl<MachineBasicBlock *> &RestoreBBs);
+                          SmallVectorImpl<MachineBasicBlock *> &RestoreBBs) const;
 
   /// To find push/pop instructions for each callee saved instruction.
   void findCSInstrs(MachineFrameInfo &,
                     const SmallVectorImpl<MachineBasicBlock *> &SaveBBs,
                     const SmallVectorImpl<MachineBasicBlock *> &RestoreBBs,
-                    vector<CalleeSavedInstr> &);
+                    vector<CalleeSavedInstr> &) const;
 };
 
 char FunctionReorderPass::ID = 0;
@@ -121,29 +121,36 @@ bool CallSpillEli::runOnMachineFunction(MachineFunction &MF) {
     return false;
   }
 
+  // Find all callers to this MachineFunction.
   // Require all callers' register allocation to be done. Abort if not.
-  if (!all_of(F->users(), [&](const User *U) {
-              return MFA.getMFOf(cast<Instruction>(U)->getFunction()); })) {
+  SmallVector<const MachineInstr *, 4> Callers;
+  if (!findCallers(MF, MFA, Callers)) {
     DEBUG(dbgs() << "Register allocation for some callers of function '"
-                 << MF.getName() << "' are not yet done. Aborted\n");
+                 << MF.getName() << "' are not yet done. Aborted.\n");
     return false;
   }
 
   SmallVector<MachineBasicBlock *, 4> SaveBBs, RestoreBBs;
   vector<CalleeSavedInstr> CSInstrs;
 
+  // Find original save/restore instructions.
   findSaveRestoreBBs(MF, SaveBBs, RestoreBBs);
   assert(!SaveBBs.empty() && !RestoreBBs.empty());
   findCSInstrs(*MF.getFrameInfo(), SaveBBs, RestoreBBs, CSInstrs);
+  if (CSInstrs.empty()) {
+    DEBUG(dbgs() << "Function '" << MF.getName() << "' does not save/restore "
+                 << "any callee-saved register. Aborted.\n");
+    return false;
+  }
 
   return false;
 }
 
 /// The implementation comes from PEI::calculateSaveRestoreBlocks in
 /// lib/CodeGen/PrologueEpilogueInserter.cpp
-void CallSpillEli::findSaveRestoreBBs(MachineFunction &MF,
-                                      SmallVectorImpl<MachineBasicBlock *> &SaveBBs,
-                                      SmallVectorImpl<MachineBasicBlock *> &RestoreBBs) {
+void CallSpillEli::findSaveRestoreBBs(
+    MachineFunction &MF, SmallVectorImpl<MachineBasicBlock *> &SaveBBs,
+    SmallVectorImpl<MachineBasicBlock *> &RestoreBBs) const {
   SaveBBs.clear();
   RestoreBBs.clear();
   const MachineFrameInfo *MFI = MF.getFrameInfo();
@@ -175,10 +182,10 @@ void CallSpillEli::findSaveRestoreBBs(MachineFunction &MF,
   }
 }
 
-void CallSpillEli::findCSInstrs(MachineFrameInfo &MFI,
-                                const SmallVectorImpl<MachineBasicBlock *> &SaveBBs,
-                                const SmallVectorImpl<MachineBasicBlock *> &RestoreBBs,
-                                vector<CalleeSavedInstr> &CSInstrs) {
+void CallSpillEli::findCSInstrs(
+    MachineFrameInfo &MFI, const SmallVectorImpl<MachineBasicBlock *> &SaveBBs,
+    const SmallVectorImpl<MachineBasicBlock *> &RestoreBBs,
+    vector<CalleeSavedInstr> &CSInstrs) const {
   SmallVector<MachineBasicBlock::iterator, 4> SaveBBIts(SaveBBs.size());
   SmallVector<MachineBasicBlock::reverse_iterator, 4> RestoreBBIts(RestoreBBs.size());
   transform(SaveBBs, SaveBBIts.begin(), [](MachineBasicBlock *MBB) { return MBB->begin(); });
