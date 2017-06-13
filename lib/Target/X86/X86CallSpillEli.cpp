@@ -60,7 +60,7 @@ private:
                           SmallVectorImpl<MachineBasicBlock *> &RestoreBBs) const;
 
   /// To find push/pop instructions for each callee saved instruction.
-  void findCSInstrs(MachineFrameInfo &,
+  void findCSInstrs(MachineFunction &,
                     const SmallVectorImpl<MachineBasicBlock *> &SaveBBs,
                     const SmallVectorImpl<MachineBasicBlock *> &RestoreBBs,
                     vector<CalleeSavedInstr> &) const;
@@ -148,7 +148,7 @@ bool CallSpillEli::runOnMachineFunction(MachineFunction &MF) {
   // Find original save/restore instructions.
   findSaveRestoreBBs(MF, SaveBBs, RestoreBBs);
   assert(!SaveBBs.empty() && !RestoreBBs.empty());
-  findCSInstrs(*MF.getFrameInfo(), SaveBBs, RestoreBBs, CSInstrs);
+  findCSInstrs(MF, SaveBBs, RestoreBBs, CSInstrs);
   if (CSInstrs.empty()) {
     DEBUG(dbgs() << "Function '" << MF.getName() << "' does not save/restore "
                  << "any callee-saved register. Aborted.\n");
@@ -216,17 +216,19 @@ void CallSpillEli::findSaveRestoreBBs(
 }
 
 void CallSpillEli::findCSInstrs(
-    MachineFrameInfo &MFI, const SmallVectorImpl<MachineBasicBlock *> &SaveBBs,
+    MachineFunction &MF, const SmallVectorImpl<MachineBasicBlock *> &SaveBBs,
     const SmallVectorImpl<MachineBasicBlock *> &RestoreBBs,
     vector<CalleeSavedInstr> &CSInstrs) const {
+  MachineFrameInfo &MFI = *MF.getFrameInfo();
+
   SmallVector<MachineBasicBlock::iterator, 4> SaveBBIts(SaveBBs.size());
   SmallVector<MachineBasicBlock::reverse_iterator, 4> RestoreBBIts(RestoreBBs.size());
   transform(SaveBBs, SaveBBIts.begin(), [](MachineBasicBlock *MBB) { return MBB->begin(); });
   transform(RestoreBBs, RestoreBBIts.begin(), [](MachineBasicBlock *MBB) { return MBB->rbegin(); });
 
   vector<CalleeSavedInfo> CSIs(MFI.getCalleeSavedInfo());
-  sort(CSIs.begin(), CSIs.end(), [](const CalleeSavedInfo &lhs, const CalleeSavedInfo &rhs) {
-    return lhs.getFrameIdx() > rhs.getFrameIdx();
+  sort(CSIs.begin(), CSIs.end(), [&](const CalleeSavedInfo &lhs, const CalleeSavedInfo &rhs) {
+    return MFI.getObjectOffset(lhs.getFrameIdx()) > MFI.getObjectOffset(rhs.getFrameIdx());
   });
 
   CSInstrs.clear();
@@ -235,20 +237,22 @@ void CallSpillEli::findCSInstrs(
 
     // Find pushes in prologues.
     for (auto &SaveBBIt : SaveBBIts) {
-      while (SaveBBIt->getOpcode() != X86::PUSH64r)
+      while (SaveBBIt->getOpcode() != X86::PUSH64r ||
+             SaveBBIt->getOperand(0).getReg() != CSI.getReg()) {
         ++SaveBBIt;
-      assert(SaveBBIt->getFlag(MachineInstr::FrameSetup) &&
-             SaveBBIt->getOperand(0).getReg() == CSI.getReg());
-      CSInstr.PushInstrs.push_back(&*(SaveBBIt++));
+      }
+      assert(SaveBBIt->getFlag(MachineInstr::FrameSetup));
+      CSInstr.PushInstrs.push_back(&*SaveBBIt);
     }
 
     // Find pops in epilogues.
     for (auto &RestoreBBIt : RestoreBBIts) {
-      while (RestoreBBIt->getOpcode() != X86::POP64r)
+      while (RestoreBBIt->getOpcode() != X86::POP64r ||
+             RestoreBBIt->getOperand(0).getReg() != CSI.getReg()) {
         ++RestoreBBIt;
-      assert(RestoreBBIt->getFlag(MachineInstr::FrameDestroy) &&
-             RestoreBBIt->getOperand(0).getReg() == CSI.getReg());
-      CSInstr.PopInstrs.push_back(&*(RestoreBBIt++));
+      }
+      assert(RestoreBBIt->getFlag(MachineInstr::FrameDestroy));
+      CSInstr.PopInstrs.push_back(&*RestoreBBIt);
     }
 
     CSInstrs.emplace_back(move(CSInstr));
