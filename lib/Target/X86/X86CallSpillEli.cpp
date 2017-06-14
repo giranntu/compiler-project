@@ -159,27 +159,98 @@ bool CallSpillEli::runOnMachineFunction(MachineFunction &MF) {
   // need modification to support multiple callers.
   const MachineInstr *TheCaller = Callers.front();
   const MachineBasicBlock *CallerBB = TheCaller->getParent();
-  const TargetRegisterInfo *RegInfo = MF.getRegInfo().getTargetRegisterInfo();
+  MachineRegisterInfo &MFRegInfo = MF.getRegInfo();
+  const TargetRegisterInfo *RegInfo = MFRegInfo.getTargetRegisterInfo();
 
+  // The utility 'computeRegisterLiveness' can give information about register
+  // liveness. It performs linear search on previous and next few instructions
+  // of the specified instruction, so there is chance to get uncertain replies.
+  // Adjust the last (hidden) argument of this utility to give more chance to
+  // find dead registers.
+  auto isDeadInCaller = [=](unsigned Reg) -> bool {
+    return CallerBB->computeRegisterLiveness(RegInfo, Reg, TheCaller, 100) ==
+           MachineBasicBlock::LQR_Dead;
+  };
+
+  // To check if a register is fully free; that is, all its subregisters are
+  // not referenced in the machine function.
+  auto isFreeReg = [&](unsigned Reg) -> bool {
+    auto SubRegIt = MCSubRegIterator(Reg, RegInfo, true);
+    while (SubRegIt.isValid()) {
+      if (!MFRegInfo.reg_empty(*SubRegIt))
+        return false;
+
+      ++SubRegIt;
+    }
+
+    return true;
+  };
+
+  // To check if two registers have same addressed ability. For example,
+  // <RAX> can be addressed by <RAX>, <EAX>, <AX>, <AH>, <AL>, but
+  // <RBP> can only be addressed by <RBP>, <EBP>, <BP>, <BPL>.
+  // TODO: Current checking method may loose some chance since FromReg
+  // is not necessory addressed specially in the machine function.
+  auto isSameAddressable = [](unsigned FromReg, unsigned ToReg) -> bool {
+    return !X86::GR64_ABCDRegClass.contains(FromReg) ||
+           X86::GR64_ABCDRegClass.contains(ToReg);
+  };
+
+  CallerBB->dump();
   bool changed = false;
   for (CalleeSavedInstr &CSI : CSInstrs) {
-    // The utility 'computeRegisterLiveness' can give information about register
-    // liveness. It performs linear search on previous and next few instructions
-    // of the specified instruction, so there is chance to get uncertain replies.
-    // Adjust the last (hidden) argument of this utility to give more chance to
-    // find dead registers.
-    if (CallerBB->computeRegisterLiveness(RegInfo, CSI.Info.getReg(), TheCaller) ==
-        MachineBasicBlock::LQR_Dead) {
-      DEBUG(dbgs() << "Callee-saved register <" << RegInfo->getName(CSI.Info.getReg())
+    unsigned SavedReg = CSI.Info.getReg();
+
+    // If SavedReg is originally dead in the caller, there is no longer need
+    // to save it.
+    if (isDeadInCaller(SavedReg)) {
+      DEBUG(dbgs() << "Callee-saved register <" << RegInfo->getName(SavedReg)
                    << "> is discarded to spill in function '" << MF.getName()
                    << "' because it is originally dead in the caller.\n");
-      discardRegSave(CSI);
-      changed = true;
-    } else {
-      DEBUG(dbgs() << "Callee-saved register <" << RegInfo->getName(CSI.Info.getReg())
-                   << "> in function '" << MF.getName() << "' is NOT discarded "
-                   << "because it is not sure to be originally dead in the caller.\n");
+      goto DiscardSaving;
     }
+
+    // It is uncertain that SavedReg is dead in the caller, so try to rename
+    // the register to another available (non-reserved, not used in callee,
+    // and dead in the caller) GPR to look for chance of not saving.
+    // TODO: Non-callee-saved registers can be used directly no matter they
+    // are dead in the caller or not.
+    for (auto OtherReg : reverse(X86::GR64RegClass)) {
+      if (!MFRegInfo.isReserved(OtherReg) && isFreeReg(OtherReg) &&
+          isSameAddressable(SavedReg, OtherReg) && isDeadInCaller(OtherReg)) {
+        // Rename the register and all its sub-registers.
+        MFRegInfo.replaceRegWith(SavedReg, OtherReg);
+
+        auto SubRegIt = MCSubRegIndexIterator(SavedReg, RegInfo);
+        while (SubRegIt.isValid()) {
+          MFRegInfo.replaceRegWith(
+              SubRegIt.getSubReg(),
+              RegInfo->getSubReg(OtherReg, SubRegIt.getSubRegIndex()));
+          ++SubRegIt;
+        }
+
+        CSI.Info = CalleeSavedInfo(OtherReg, CSI.Info.getFrameIdx());
+        ++NumRegRenamed;
+
+        DEBUG(dbgs() << "Callee-saved register <" << RegInfo->getName(SavedReg)
+                     << "> in function '" << MF.getName() << "' has been "
+                     << "renamed to <" << RegInfo->getName(OtherReg) << ">, "
+                     << "which is dead in the caller, and the register saving "
+                     << "for it is discarded safely.\n");
+        goto DiscardSaving;
+      }
+    }
+
+    // There is no chance to discard the register saving in the callee using
+    // current techniques.
+    DEBUG(dbgs() << "Callee-saved register <" << RegInfo->getName(SavedReg)
+                 << "> in function '" << MF.getName() << "' is NOT discarded "
+                 << "because it is not sure to be originally dead in the caller.\n");
+    continue;
+
+DiscardSaving:
+    discardRegSave(CSI);
+    changed = true;
   }
 
   return changed;
@@ -303,6 +374,10 @@ void CallSpillEli::discardRegSave(CalleeSavedInstr &CSI) const {
 
   for (auto &PushPops : { CSI.PushInstrs, CSI.PopInstrs }) {
     for (MachineInstr *MInstr : PushPops) {
+      assert((MInstr->getOpcode() == X86::PUSH64r ||
+              MInstr->getOpcode() == X86::POP64r) &&
+             MInstr->getOperand(0).getReg() == CSI.Info.getReg());
+
       MInstr->eraseFromParent();
       ++NumMInstEliminated;
     }
