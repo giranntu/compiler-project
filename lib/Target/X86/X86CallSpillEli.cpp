@@ -161,6 +161,7 @@ bool CallSpillEli::runOnMachineFunction(MachineFunction &MF) {
   const MachineBasicBlock *CallerBB = TheCaller->getParent();
   const TargetRegisterInfo *RegInfo = MF.getRegInfo().getTargetRegisterInfo();
 
+  bool changed = false;
   for (CalleeSavedInstr &CSI : CSInstrs) {
     // The utility 'computeRegisterLiveness' can give information about register
     // liveness. It performs linear search on previous and next few instructions
@@ -173,10 +174,15 @@ bool CallSpillEli::runOnMachineFunction(MachineFunction &MF) {
                    << "> is discarded to spill in function '" << MF.getName()
                    << "' because it is originally dead in the caller.\n");
       discardRegSave(CSI);
+      changed = true;
+    } else {
+      DEBUG(dbgs() << "Callee-saved register <" << RegInfo->getName(CSI.Info.getReg())
+                   << "> in function '" << MF.getName() << "' is NOT discarded "
+                   << "because it is not sure to be originally dead in the caller.\n");
     }
   }
 
-  return false;
+  return changed;
 }
 
 /// The implementation comes from PEI::calculateSaveRestoreBlocks in
