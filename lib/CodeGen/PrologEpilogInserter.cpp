@@ -440,16 +440,18 @@ static void updateLiveness(MachineFunction &MF) {
         WorkList.push_back(SuccBB);
   }
 
-  const std::vector<CalleeSavedInfo> &CSI = MFI->getCalleeSavedInfo();
+  const MCPhysReg *CSRegs =
+      MF.getRegInfo().getTargetRegisterInfo()->getCalleeSavedRegs(&MF);
 
-  for (unsigned i = 0, e = CSI.size(); i != e; ++i) {
+  while (*CSRegs) {
     for (MachineBasicBlock *MBB : Visited) {
-      MCPhysReg Reg = CSI[i].getReg();
       // Add the callee-saved register as live-in.
       // It's killed at the spill.
-      if (!MBB->isLiveIn(Reg))
-        MBB->addLiveIn(Reg);
+      if (!MBB->isLiveIn(*CSRegs))
+        MBB->addLiveIn(*CSRegs);
     }
+
+    ++CSRegs;
   }
 }
 
