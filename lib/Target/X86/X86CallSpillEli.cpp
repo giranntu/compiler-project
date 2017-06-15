@@ -2,6 +2,7 @@
 #include "X86InstrInfo.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SparseSet.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/DepthFirstIterator.h"
 #include "llvm/Analysis/CallGraph.h"
@@ -74,6 +75,19 @@ private:
 
   /// Discard saving/restoring the specified callee-saved register.
   void discardRegSave(CalleeSavedInstr &) const;
+
+  /// To check if specified register is a callee-saved register.
+  bool isCalleeSavedReg(const MachineFunction &, unsigned Reg) const;
+
+  /// Check wheter the specified function does not call any children
+  /// function.
+  bool hasNoCall(const MachineFunction &) const;
+
+  /// A cache data structure used by isCalleeSavedReg.
+  mutable struct {
+    const MCPhysReg *Ptr;
+    SparseSet<unsigned> Regs;
+  } CalleeSavedRegsCache;
 };
 
 char FunctionReorderPass::ID = 0;
@@ -168,8 +182,9 @@ bool CallSpillEli::runOnMachineFunction(MachineFunction &MF) {
   // Adjust the last (hidden) argument of this utility to give more chance to
   // find dead registers.
   auto isDeadInCaller = [=](unsigned Reg) -> bool {
-    return CallerBB->computeRegisterLiveness(RegInfo, Reg, TheCaller, 100) ==
-           MachineBasicBlock::LQR_Dead;
+    return TheCaller->getOperand(1).clobbersPhysReg(Reg) ||
+           CallerBB->computeRegisterLiveness(RegInfo, Reg, TheCaller, 100) ==
+               MachineBasicBlock::LQR_Dead;
   };
 
   // To check if a register is fully free; that is, all its subregisters are
@@ -189,14 +204,27 @@ bool CallSpillEli::runOnMachineFunction(MachineFunction &MF) {
   // To check if two registers have same addressed ability. For example,
   // <RAX> can be addressed by <RAX>, <EAX>, <AX>, <AH>, <AL>, but
   // <RBP> can only be addressed by <RBP>, <EBP>, <BP>, <BPL>.
-  // TODO: Current checking method may loose some chance since FromReg
-  // is not necessory addressed specially in the machine function.
-  auto isSameAddressable = [](unsigned FromReg, unsigned ToReg) -> bool {
-    return !X86::GR64_ABCDRegClass.contains(FromReg) ||
-           X86::GR64_ABCDRegClass.contains(ToReg);
+  auto isSameAddressable = [&](unsigned FromReg, unsigned ToReg) -> bool {
+    // Both registers have same addressed ability if FromReg does not have
+    // more addressed ability than ToReg.
+    if (!X86::GR64_ABCDRegClass.contains(FromReg) ||
+        X86::GR64_ABCDRegClass.contains(ToReg)) {
+      return true;
+    }
+
+    // Although FromReg has more addressed ability than ToReg, there is
+    // chance that FromReg is not addressed specially in the machine
+    // function.
+    unsigned SpecialAddressedReg = RegInfo->getSubReg(FromReg, 2);
+    assert(X86::GR8_ABCD_HRegClass.contains(SpecialAddressedReg));
+    return MFRegInfo.reg_empty(SpecialAddressedReg);
   };
 
-  CallerBB->dump();
+  bool NoCall = hasNoCall(MF);
+  auto wontBeClobbered = [&](unsigned Reg) -> bool {
+    return NoCall || isCalleeSavedReg(MF, Reg);
+  };
+
   bool changed = false;
   for (CalleeSavedInstr &CSI : CSInstrs) {
     unsigned SavedReg = CSI.Info.getReg();
@@ -213,11 +241,12 @@ bool CallSpillEli::runOnMachineFunction(MachineFunction &MF) {
     // It is uncertain that SavedReg is dead in the caller, so try to rename
     // the register to another available (non-reserved, not used in callee,
     // and dead in the caller) GPR to look for chance of not saving.
-    // TODO: Non-callee-saved registers can be used directly no matter they
-    // are dead in the caller or not.
+    // Notice that it can only rename to other unused callee-saved register;
+    // otherwise, it may be overriden(clobbered) in child functions.
     for (auto OtherReg : reverse(X86::GR64RegClass)) {
-      if (!MFRegInfo.isReserved(OtherReg) && isFreeReg(OtherReg) &&
-          isSameAddressable(SavedReg, OtherReg) && isDeadInCaller(OtherReg)) {
+      if (!MFRegInfo.isReserved(OtherReg) && wontBeClobbered(OtherReg) &&
+          isFreeReg(OtherReg) && isSameAddressable(SavedReg, OtherReg) &&
+          isDeadInCaller(OtherReg)) {
         // Rename the register and all its sub-registers.
         MFRegInfo.replaceRegWith(SavedReg, OtherReg);
 
@@ -245,7 +274,8 @@ bool CallSpillEli::runOnMachineFunction(MachineFunction &MF) {
     // current techniques.
     DEBUG(dbgs() << "Callee-saved register <" << RegInfo->getName(SavedReg)
                  << "> in function '" << MF.getName() << "' is NOT discarded "
-                 << "because it is not sure to be originally dead in the caller.\n");
+                 << "because it as well as other registers it can rename to "
+                 << "are not sure to be originally dead in the caller.\n");
     continue;
 
 DiscardSaving:
@@ -382,4 +412,33 @@ void CallSpillEli::discardRegSave(CalleeSavedInstr &CSI) const {
       ++NumMInstEliminated;
     }
   }
+}
+
+bool CallSpillEli::isCalleeSavedReg(const MachineFunction &MF,
+                                    unsigned Reg) const {
+  const TargetRegisterInfo *RegInfo = MF.getRegInfo().getTargetRegisterInfo();
+  const MCPhysReg *Ptr = RegInfo->getCalleeSavedRegs(&MF);
+
+  if (Ptr != CalleeSavedRegsCache.Ptr) {
+    CalleeSavedRegsCache.Ptr = Ptr;
+    CalleeSavedRegsCache.Regs.clear();
+    CalleeSavedRegsCache.Regs.setUniverse(RegInfo->getNumRegs() + 1);
+    while (*Ptr) {
+      CalleeSavedRegsCache.Regs.insert(*Ptr);
+      ++Ptr;
+    }
+  }
+
+  return CalleeSavedRegsCache.Regs.count(Reg);
+}
+
+bool CallSpillEli::hasNoCall(const MachineFunction &MF) const {
+  for (const MachineBasicBlock &MBB : MF) {
+    for (const MachineInstr &MI : MBB) {
+      if (MI.isCall())
+        return false;
+    }
+  }
+
+  return true;
 }
