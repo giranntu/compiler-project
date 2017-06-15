@@ -11,6 +11,7 @@
 #include "llvm/CodeGen/MachineFunctionAnalysis.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/Pass.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 using namespace llvm;
 using namespace std;
@@ -21,6 +22,11 @@ STATISTIC(NumSpillEliminated, "Number of register spills eliminated");
 STATISTIC(NumMInstEliminated, "Number of instructions eliminated");
 STATISTIC(NumRegRenamed, "Number of register renamed in callee");
 STATISTIC(NumVersionAdded, "Number of additional versions of functions");
+
+static cl::opt<unsigned>
+LivenessCheckDepth("eli-call-spill-depth",
+                   cl::desc("The depth to check register liveness in the caller."),
+                   cl::init(10), cl::Hidden);
 
 namespace {
 /// A pass to reorder functions in a module to make it the DFS
@@ -127,23 +133,28 @@ bool CallSpillEli::runOnMachineFunction(MachineFunction &MF) {
   MachineFunctionAnalysis &MFA = getAnalysis<MachineFunctionAnalysis>();
   const Function *F = MF.getFunction();
 
+  auto FunctionAbort = [&](StringRef Reason) {
+    DEBUG(dbgs() << "[X] Function aborted: " << MF.getName() << "\n" << Reason);
+  };
+  auto FunctionProcessed = [&]() {
+    DEBUG(dbgs() << "[V] Function processed: " << MF.getName() << "\n");
+  };
+
   // Require callers of the function to be determinable, and abort if not.
   // Thatis, it cannot have either external linkage (may be called from
   // other modules) or address taken (may be called indirectly).
   if (F->hasAddressTaken() || !F->hasLocalLinkage()) {
-    DEBUG(dbgs() << "Callers of function '" << MF.getName() << "' are not "
-                 << "trackable because either it has external linkage or it "
-                 << "might be called indirectly (it has its address taken). "
-                 << "Aborted.\n");
+    FunctionAbort("\tIt is not trackable because either it has external\n"
+                  "\tlinkage or it might be called indirectly (it has its\n"
+                  "\taddress taken). \n");
     return false;
   }
 
   // Require the function to has only one caller. Currently abort if not.
   // TODO: It shall be able to analysis register usage of all callers.
   if (F->getNumUses() != 1) {
-    DEBUG(dbgs() << "Function '" << MF.getName() << "' has either zero or "
-                 << "more than one callers which is currently not supported. "
-                 << "Aborted.\n");
+    FunctionAbort("\tIt has either zero or more than one callers, which\n"
+                  "\tis currently not supported. \n");
     return false;
   }
 
@@ -151,8 +162,7 @@ bool CallSpillEli::runOnMachineFunction(MachineFunction &MF) {
   // Require all callers' register allocation to be done. Abort if not.
   SmallVector<const MachineInstr *, 4> Callers;
   if (!findCallers(MF, MFA, Callers)) {
-    DEBUG(dbgs() << "Register allocation for some callers of function '"
-                 << MF.getName() << "' are not yet done. Aborted.\n");
+    FunctionAbort("\tRegister allocation for some callers are not yet done.\n");
     return false;
   }
 
@@ -164,10 +174,11 @@ bool CallSpillEli::runOnMachineFunction(MachineFunction &MF) {
   assert(!SaveBBs.empty() && !RestoreBBs.empty());
   findCSInstrs(MF, SaveBBs, RestoreBBs, CSInstrs);
   if (CSInstrs.empty()) {
-    DEBUG(dbgs() << "Function '" << MF.getName() << "' does not save/restore "
-                 << "any callee-saved register. Aborted.\n");
+    FunctionAbort("\tIt does not save/restore any callee-saved register.\n");
     return false;
   }
+
+  FunctionProcessed();
 
   // TODO: Currently it only supports one caller. However, following code
   // need modification to support multiple callers.
@@ -176,14 +187,24 @@ bool CallSpillEli::runOnMachineFunction(MachineFunction &MF) {
   MachineRegisterInfo &MFRegInfo = MF.getRegInfo();
   const TargetRegisterInfo *RegInfo = MFRegInfo.getTargetRegisterInfo();
 
+  auto RegEliFailed = [&](unsigned Reg, StringRef Reason) {
+    DEBUG(dbgs() << "\t[X] Register saving kept: <" << RegInfo->getName(Reg)
+                 << ">\n" << Reason);
+  };
+#define RegEliSuccessed(Reg, Reason)                                           \
+  DEBUG(dbgs() << "\t[V] Register saving discarded: <"                         \
+               << RegInfo->getName(Reg) << ">\n"                               \
+               << Reason);
+
   // The utility 'computeRegisterLiveness' can give information about register
   // liveness. It performs linear search on previous and next few instructions
   // of the specified instruction, so there is chance to get uncertain replies.
-  // Adjust the last (hidden) argument of this utility to give more chance to
+  // Adjust the command line option "LivenessCheckDepth" to give more chance to
   // find dead registers.
   auto isDeadInCaller = [=](unsigned Reg) -> bool {
     return TheCaller->getOperand(1).clobbersPhysReg(Reg) ||
-           CallerBB->computeRegisterLiveness(RegInfo, Reg, TheCaller, 100) ==
+           CallerBB->computeRegisterLiveness(RegInfo, Reg, TheCaller,
+                                             LivenessCheckDepth) ==
                MachineBasicBlock::LQR_Dead;
   };
 
@@ -232,9 +253,7 @@ bool CallSpillEli::runOnMachineFunction(MachineFunction &MF) {
     // If SavedReg is originally dead in the caller, there is no longer need
     // to save it.
     if (isDeadInCaller(SavedReg)) {
-      DEBUG(dbgs() << "Callee-saved register <" << RegInfo->getName(SavedReg)
-                   << "> is discarded to spill in function '" << MF.getName()
-                   << "' because it is originally dead in the caller.\n");
+      RegEliSuccessed(SavedReg, "\t\tIt is originally dead in the caller.\n");
       goto DiscardSaving;
     }
 
@@ -261,27 +280,27 @@ bool CallSpillEli::runOnMachineFunction(MachineFunction &MF) {
         CSI.Info = CalleeSavedInfo(OtherReg, CSI.Info.getFrameIdx());
         ++NumRegRenamed;
 
-        DEBUG(dbgs() << "Callee-saved register <" << RegInfo->getName(SavedReg)
-                     << "> in function '" << MF.getName() << "' has been "
-                     << "renamed to <" << RegInfo->getName(OtherReg) << ">, "
-                     << "which is dead in the caller, and the register saving "
-                     << "for it is discarded safely.\n");
+        RegEliSuccessed(SavedReg,
+                        "\t\tIt has been renamed to <" << RegInfo->getName(OtherReg)
+                        << ">, which is dead\n"
+                        "\t\tin the caller, and the register saving for it\n"
+                        "\t\tis discarded safely.\n");
         goto DiscardSaving;
       }
     }
 
     // There is no chance to discard the register saving in the callee using
     // current techniques.
-    DEBUG(dbgs() << "Callee-saved register <" << RegInfo->getName(SavedReg)
-                 << "> in function '" << MF.getName() << "' is NOT discarded "
-                 << "because it as well as other registers it can rename to "
-                 << "are not sure to be originally dead in the caller.\n");
+    RegEliFailed(SavedReg,
+                 "\t\tIt as well as other registers it can rename to\n"
+                 "\t\tare not sure to be originally dead in the caller.\n");
     continue;
 
 DiscardSaving:
     discardRegSave(CSI);
     changed = true;
   }
+#undef RegEliSuccessed
 
   return changed;
 }

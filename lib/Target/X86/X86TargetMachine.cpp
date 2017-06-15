@@ -228,6 +228,11 @@ UseVZeroUpper("x86-use-vzeroupper", cl::Hidden,
   cl::desc("Minimize AVX to SSE transition penalty"),
   cl::init(true));
 
+static cl::opt<bool>
+UseCallSpillEli("x86-call-spill-eli",
+                cl::desc("Enable callee-saved registers' spills eliminator"),
+                cl::init(false));
+
 //===----------------------------------------------------------------------===//
 // X86 TTI query.
 //===----------------------------------------------------------------------===//
@@ -339,5 +344,6 @@ void X86PassConfig::addPreEmitPass() {
     addPass(createX86FixupLEAs());
   }
 
-  addPass(createX86CallSpillEliPass());
+  if (UseCallSpillEli)
+    addPass(createX86CallSpillEliPass());
 }
