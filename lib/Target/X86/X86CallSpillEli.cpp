@@ -21,12 +21,17 @@ using namespace std;
 STATISTIC(NumSpillEliminated, "Number of register spills eliminated");
 STATISTIC(NumMInstEliminated, "Number of instructions eliminated");
 STATISTIC(NumRegRenamed, "Number of register renamed in callee");
-STATISTIC(NumVersionAdded, "Number of additional versions of functions");
 
 static cl::opt<unsigned>
 LivenessCheckDepth("eli-call-spill-depth",
                    cl::desc("The depth to check register liveness in the caller."),
                    cl::init(10), cl::Hidden);
+
+static cl::opt<bool>
+NoCSRInRun("no-livein-run",
+            cl::desc("Assume there is a 'safe_run' wrapper which is the only caller of "
+                     "'run', so there will be no live-in register in 'run'."),
+            cl::init(true), cl::Hidden);
 
 namespace {
 /// A pass to reorder functions in a module to make it the DFS
@@ -47,6 +52,15 @@ struct CallSpillEli : public MachineFunctionPass {
   CallSpillEli() : MachineFunctionPass(ID) {}
 
   bool runOnMachineFunction(MachineFunction &MF) override;
+
+  bool doFinalization(Module &M) override {
+    for (auto &R : FnDeadRegs) {
+      delete R.second;
+    }
+    FnDeadRegs.clear();
+
+    return false;
+  }
 
   const char *getPassName() const override {
     return "X86 call spillings eliminator";
@@ -77,9 +91,8 @@ private:
   /// Find callers of the machine function <Of>. The result machine instructions
   /// are stored in <Callers>. It returns false if the MachineFunction of any
   /// caller is still unavailable.
-  static bool findCallers(const MachineFunction &Of,
-                          const MachineFunctionAnalysis &,
-                          SmallVectorImpl<const MachineInstr *> &Callers);
+  bool findCallers(const MachineFunction &Of,
+                   SmallVectorImpl<const MachineInstr *> &Callers) const;
 
   /// Discard saving/restoring the specified callee-saved register.
   static void discardRegSave(CalleeSavedInstr &);
@@ -87,13 +100,29 @@ private:
   /// To check if specified register is a callee-saved register.
   static bool isCalleeSavedReg(const MachineFunction &, unsigned Reg);
 
+  /// To check if a register is fully free; that is, all its subregisters are
+  /// not referenced in the machine function.
+  static bool isFreeReg(unsigned Reg, const MachineRegisterInfo &);
+
   /// To check if the register Reg is dead at the caller instruction.
-  static bool isDeadInCaller(unsigned Reg, const MachineInstr *Caller,
-                             const TargetRegisterInfo *);
+  bool isDeadInCaller(unsigned Reg, const MachineInstr *Caller,
+                      const TargetRegisterInfo *) const;
 
   /// Check wheter the specified function does not call any children
   /// function.
   static bool hasNoCall(const MachineFunction &);
+
+  /// Look for registers that are must dead in the specified function and store
+  /// the result in FnDeadRegs.
+  void updateDeadRegs(const MachineFunction &);
+
+  DenseMap<const Function *, SparseSet<unsigned> *> FnDeadRegs;
+
+  mutable struct {
+    SmallVector<const MachineInstr *, 8> Callers;
+    bool Valid = false;
+    const MachineFunction *Of;
+  } CallersOfMF;
 };
 
 char FunctionReorderPass::ID = 0;
@@ -130,7 +159,10 @@ bool FunctionReorderPass::runOnModule(Module &M) {
 }
 
 bool CallSpillEli::runOnMachineFunction(MachineFunction &MF) {
-  MachineFunctionAnalysis &MFA = getAnalysis<MachineFunctionAnalysis>();
+/// This pass also collects register liveness information of MF (similar with
+/// RegInfoCollector). The information is collected after all things finished.
+#define RETURN(Val) updateDeadRegs(MF); return Val
+
   const Function *F = MF.getFunction();
 
   auto FunctionAbort = [&](StringRef Reason) {
@@ -147,7 +179,7 @@ bool CallSpillEli::runOnMachineFunction(MachineFunction &MF) {
     FunctionAbort("\tIt is not trackable because either it has external\n"
                   "\tlinkage or it might be called indirectly (it has its\n"
                   "\taddress taken). \n");
-    return false;
+    RETURN(false);
   }
 
   // Require the function to has only one caller. Currently abort if not.
@@ -155,15 +187,15 @@ bool CallSpillEli::runOnMachineFunction(MachineFunction &MF) {
   if (F->getNumUses() != 1) {
     FunctionAbort("\tIt has either zero or more than one callers, which\n"
                   "\tis currently not supported. \n");
-    return false;
+    RETURN(false);
   }
 
   // Find all callers to this MachineFunction.
   // Require all callers' register allocation to be done. Abort if not.
   SmallVector<const MachineInstr *, 4> Callers;
-  if (!findCallers(MF, MFA, Callers)) {
+  if (!findCallers(MF, Callers)) {
     FunctionAbort("\tRegister allocation for some callers are not yet done.\n");
-    return false;
+    RETURN(false);
   }
 
   SmallVector<MachineBasicBlock *, 4> SaveBBs, RestoreBBs;
@@ -175,7 +207,7 @@ bool CallSpillEli::runOnMachineFunction(MachineFunction &MF) {
   findCSInstrs(MF, SaveBBs, RestoreBBs, CSInstrs);
   if (CSInstrs.empty()) {
     FunctionAbort("\tIt does not save/restore any callee-saved register.\n");
-    return false;
+    RETURN(false);
   }
 
   FunctionProcessed();
@@ -194,20 +226,6 @@ bool CallSpillEli::runOnMachineFunction(MachineFunction &MF) {
   DEBUG(dbgs() << "\t[V] Register saving discarded: <"                         \
                << RegInfo->getName(Reg) << ">\n"                               \
                << Reason);
-
-  // To check if a register is fully free; that is, all its subregisters are
-  // not referenced in the machine function.
-  auto isFreeReg = [&](unsigned Reg) -> bool {
-    auto SubRegIt = MCSubRegIterator(Reg, RegInfo, true);
-    while (SubRegIt.isValid()) {
-      if (!MFRegInfo.reg_empty(*SubRegIt))
-        return false;
-
-      ++SubRegIt;
-    }
-
-    return true;
-  };
 
   // To check if two registers have same addressed ability. For example,
   // <RAX> can be addressed by <RAX>, <EAX>, <AX>, <AH>, <AL>, but
@@ -251,7 +269,8 @@ bool CallSpillEli::runOnMachineFunction(MachineFunction &MF) {
     // otherwise, it may be overriden(clobbered) in child functions.
     for (auto OtherReg : reverse(X86::GR64RegClass)) {
       if (!MFRegInfo.isReserved(OtherReg) && wontBeClobbered(OtherReg) &&
-          isFreeReg(OtherReg) && isSameAddressable(SavedReg, OtherReg) &&
+          isFreeReg(OtherReg, MFRegInfo) &&
+          isSameAddressable(SavedReg, OtherReg) &&
           isDeadInCaller(OtherReg, TheCaller, RegInfo)) {
         // Rename the register and all its sub-registers.
         MFRegInfo.replaceRegWith(SavedReg, OtherReg);
@@ -289,7 +308,8 @@ DiscardSaving:
   }
 #undef RegEliSuccessed
 
-  return changed;
+  RETURN(changed);
+#undef RETURN
 }
 
 /// The implementation comes from PEI::calculateSaveRestoreBlocks in
@@ -372,36 +392,51 @@ void CallSpillEli::findCSInstrs(
   }
 }
 
-bool CallSpillEli::findCallers(const MachineFunction &MF,
-                               const MachineFunctionAnalysis &MFAnalysis,
-                               SmallVectorImpl<const MachineInstr *> &Results) {
-  DenseSet<const Function *> Searched;
+bool CallSpillEli::findCallers(
+    const MachineFunction &MF,
+    SmallVectorImpl<const MachineInstr *> &Results) const {
+  if (CallersOfMF.Of == &MF) {
+    if (CallersOfMF.Valid)
+      Results = CallersOfMF.Callers;
+    return CallersOfMF.Valid;
+  }
+
+  CallersOfMF.Of = &MF;
   const Function *F = MF.getFunction();
+  const MachineFunctionAnalysis &MFA = getAnalysis<MachineFunctionAnalysis>();
 
-  Results.clear();
-  for (const User *U : F->users()) {
-    const Function *CallerFn = cast<Instruction>(U)->getFunction();
+  SmallVector<const MachineFunction *, 8> CallerMFs(F->getNumUses());
 
-    // There may be multiple callers in one function.
-    // Skip searched functions.
-    if (!Searched.insert(CallerFn).second) {
-      continue;
-    }
+  transform(F->users(), CallerMFs.begin(), [&](const User *U) {
+    return MFA.getMFOf(cast<Instruction>(U)->getFunction());
+  });
+  if (count(CallerMFs.begin(), CallerMFs.end(), nullptr)) {
+    CallersOfMF.Valid = false;
+    return false;
+  }
 
-    if (const MachineFunction *MF = MFAnalysis.getMFOf(CallerFn)) {
-      for (auto &MBB : *MF) {
-        for (auto &MInstr : MBB) {
-          if (MInstr.isCall() && MInstr.getOperand(0).getGlobal() == F) {
-            Results.push_back(&MInstr);
-          }
+  DenseSet<const MachineFunction *> CallerMFSet;
+  CallerMFSet.insert(CallerMFs.begin(), CallerMFs.end());
+  CallersOfMF.Callers.clear();
+
+  for (const MachineFunction *CMF : CallerMFSet) {
+    for (const MachineBasicBlock &MBB : *CMF) {
+      for (const MachineInstr &MI : MBB) {
+        if (!MI.isCall())
+          continue;
+
+        const MachineOperand &CalleeOp = MI.getOperand(0);
+        if ((CalleeOp.isSymbol() && MF.getName() == CalleeOp.getSymbolName()) ||
+            (CalleeOp.isGlobal() && CalleeOp.getGlobal() == F)) {
+          CallersOfMF.Callers.push_back(&MI);
         }
       }
-    } else {
-      return false;
     }
   }
 
-  assert(Results.size() == F->getNumUses());
+  assert(CallersOfMF.Callers.size() == F->getNumUses());
+  CallersOfMF.Valid = true;
+  Results = CallersOfMF.Callers;
   return true;
 }
 
@@ -442,6 +477,20 @@ bool CallSpillEli::isCalleeSavedReg(const MachineFunction &MF, unsigned Reg) {
   return CalleeSavedRegsCache.Regs.count(Reg);
 }
 
+bool CallSpillEli::isFreeReg(unsigned Reg,
+                             const MachineRegisterInfo &MFRegInfo) {
+  const TargetRegisterInfo *RegInfo = MFRegInfo.getTargetRegisterInfo();
+  auto SubRegIt = MCSubRegIterator(Reg, RegInfo, true);
+  while (SubRegIt.isValid()) {
+    if (!MFRegInfo.reg_empty(*SubRegIt))
+      return false;
+
+    ++SubRegIt;
+  }
+
+  return true;
+}
+
 /// The implementation is from MachineBasicBlock::computeRegisterLiveness
 /// defined in lib/CodeGen/MachineBasicBlock.cpp. However, the implementation
 /// here does not use the live-in information of each machine basic block.
@@ -450,12 +499,17 @@ bool CallSpillEli::isCalleeSavedReg(const MachineFunction &MF, unsigned Reg) {
 /// Adjust the command line option "LivenessCheckDepth" to give more chance to
 /// find dead registers.
 bool CallSpillEli::isDeadInCaller(unsigned Reg, const MachineInstr *Before,
-                                  const TargetRegisterInfo *TRI) {
-  if (Before->getOperand(1).clobbersPhysReg(Reg))
+                                  const TargetRegisterInfo *TRI) const {
+  // FnDeadRegs is a table maintained to store registers that are must dead in
+  // specified function. The table is built from the super-super callers. Find
+  // registers from it may give more chance than linear searching the machine
+  // basic block
+  const MachineBasicBlock *MBB = Before->getParent();
+  if (FnDeadRegs.find(MBB->getParent()->getFunction())->second->count(Reg) ||
+      Before->getOperand(1).clobbersPhysReg(Reg))
     return true;
 
   unsigned N = LivenessCheckDepth;
-  const MachineBasicBlock *MBB = Before->getParent();
 
   // Start by searching backwards from Before, looking for kills, reads or defs.
   MachineBasicBlock::const_iterator I(Before);
@@ -523,4 +577,55 @@ bool CallSpillEli::hasNoCall(const MachineFunction &MF) {
   }
 
   return true;
+}
+
+/// It first tracks possible dead registers by finding the interaction of dead
+/// registers of all callers. Then, exclude those used in this function.
+void CallSpillEli::updateDeadRegs(const MachineFunction &MF) {
+  SparseSet<unsigned> InitialDeadRegs;
+  const Function *F = MF.getFunction();
+  const MachineRegisterInfo &MRegInfo = MF.getRegInfo();
+  const TargetRegisterInfo &TRegInfo = *MRegInfo.getTargetRegisterInfo();
+
+  InitialDeadRegs.setUniverse(TRegInfo.getNumRegs() + 1);
+
+  // There is an assumed starting point.
+  if (NoCSRInRun && MF.getName() == "run") {
+    const MCPhysReg *CSR = TRegInfo.getCalleeSavedRegs(&MF);
+    while (*CSR) {
+      InitialDeadRegs.insert(*(CSR++));
+    }
+
+  // If callers of this function are not trackable, all registers may be
+  // alive.
+  } else if (F->hasLocalLinkage() && !F->hasAddressTaken()) {
+    SmallVector<const MachineInstr *, 8> CallerInsts;
+
+    if (findCallers(MF, CallerInsts)) {
+      const MCPhysReg *CSR = TRegInfo.getCalleeSavedRegs(&MF);
+      while (*CSR) {
+        auto dead = [&](const MachineInstr *Caller) {
+          return isDeadInCaller(*CSR, Caller, &TRegInfo);
+        };
+
+        // This register is dead in all callers, so it is also dead in the entry
+        // of this function.
+        if (all_of(CallerInsts, dead)) {
+          InitialDeadRegs.insert(*CSR);
+        }
+
+        ++CSR;
+      }
+    }
+  }
+
+  SparseSet<unsigned> &FinalDeadRegs =
+      *(FnDeadRegs[F] = new SparseSet<unsigned>);
+  FinalDeadRegs.setUniverse(TRegInfo.getNumRegs() + 1);
+
+  // Exclude registers used in this function.
+  for (unsigned Reg : InitialDeadRegs) {
+    if (isFreeReg(Reg, MRegInfo))
+      FinalDeadRegs.insert(Reg);
+  }
 }
