@@ -62,38 +62,38 @@ private:
   };
 
   /// Find save and restore blocks in the machine function.
-  void findSaveRestoreBBs(MachineFunction &,
-                          SmallVectorImpl<MachineBasicBlock *> &SaveBBs,
-                          SmallVectorImpl<MachineBasicBlock *> &RestoreBBs) const;
+  static void
+  findSaveRestoreBBs(MachineFunction &,
+                     SmallVectorImpl<MachineBasicBlock *> &SaveBBs,
+                     SmallVectorImpl<MachineBasicBlock *> &RestoreBBs);
 
   /// To find push/pop instructions for each callee saved instruction.
-  void findCSInstrs(MachineFunction &,
-                    const SmallVectorImpl<MachineBasicBlock *> &SaveBBs,
-                    const SmallVectorImpl<MachineBasicBlock *> &RestoreBBs,
-                    vector<CalleeSavedInstr> &) const;
+  static void
+  findCSInstrs(MachineFunction &,
+               const SmallVectorImpl<MachineBasicBlock *> &SaveBBs,
+               const SmallVectorImpl<MachineBasicBlock *> &RestoreBBs,
+               vector<CalleeSavedInstr> &);
 
   /// Find callers of the machine function <Of>. The result machine instructions
   /// are stored in <Callers>. It returns false if the MachineFunction of any
   /// caller is still unavailable.
-  bool findCallers(const MachineFunction &Of,
-                   const MachineFunctionAnalysis &,
-                   SmallVectorImpl<const MachineInstr *> &Callers) const;
+  static bool findCallers(const MachineFunction &Of,
+                          const MachineFunctionAnalysis &,
+                          SmallVectorImpl<const MachineInstr *> &Callers);
 
   /// Discard saving/restoring the specified callee-saved register.
-  void discardRegSave(CalleeSavedInstr &) const;
+  static void discardRegSave(CalleeSavedInstr &);
 
   /// To check if specified register is a callee-saved register.
-  bool isCalleeSavedReg(const MachineFunction &, unsigned Reg) const;
+  static bool isCalleeSavedReg(const MachineFunction &, unsigned Reg);
+
+  /// To check if the register Reg is dead at the caller instruction.
+  static bool isDeadInCaller(unsigned Reg, const MachineInstr *Caller,
+                             const TargetRegisterInfo *);
 
   /// Check wheter the specified function does not call any children
   /// function.
-  bool hasNoCall(const MachineFunction &) const;
-
-  /// A cache data structure used by isCalleeSavedReg.
-  mutable struct {
-    const MCPhysReg *Ptr;
-    SparseSet<unsigned> Regs;
-  } CalleeSavedRegsCache;
+  static bool hasNoCall(const MachineFunction &);
 };
 
 char FunctionReorderPass::ID = 0;
@@ -183,7 +183,6 @@ bool CallSpillEli::runOnMachineFunction(MachineFunction &MF) {
   // TODO: Currently it only supports one caller. However, following code
   // need modification to support multiple callers.
   const MachineInstr *TheCaller = Callers.front();
-  const MachineBasicBlock *CallerBB = TheCaller->getParent();
   MachineRegisterInfo &MFRegInfo = MF.getRegInfo();
   const TargetRegisterInfo *RegInfo = MFRegInfo.getTargetRegisterInfo();
 
@@ -195,18 +194,6 @@ bool CallSpillEli::runOnMachineFunction(MachineFunction &MF) {
   DEBUG(dbgs() << "\t[V] Register saving discarded: <"                         \
                << RegInfo->getName(Reg) << ">\n"                               \
                << Reason);
-
-  // The utility 'computeRegisterLiveness' can give information about register
-  // liveness. It performs linear search on previous and next few instructions
-  // of the specified instruction, so there is chance to get uncertain replies.
-  // Adjust the command line option "LivenessCheckDepth" to give more chance to
-  // find dead registers.
-  auto isDeadInCaller = [=](unsigned Reg) -> bool {
-    return TheCaller->getOperand(1).clobbersPhysReg(Reg) ||
-           CallerBB->computeRegisterLiveness(RegInfo, Reg, TheCaller,
-                                             LivenessCheckDepth) ==
-               MachineBasicBlock::LQR_Dead;
-  };
 
   // To check if a register is fully free; that is, all its subregisters are
   // not referenced in the machine function.
@@ -252,7 +239,7 @@ bool CallSpillEli::runOnMachineFunction(MachineFunction &MF) {
 
     // If SavedReg is originally dead in the caller, there is no longer need
     // to save it.
-    if (isDeadInCaller(SavedReg)) {
+    if (isDeadInCaller(SavedReg, TheCaller, RegInfo)) {
       RegEliSuccessed(SavedReg, "\t\tIt is originally dead in the caller.\n");
       goto DiscardSaving;
     }
@@ -265,7 +252,7 @@ bool CallSpillEli::runOnMachineFunction(MachineFunction &MF) {
     for (auto OtherReg : reverse(X86::GR64RegClass)) {
       if (!MFRegInfo.isReserved(OtherReg) && wontBeClobbered(OtherReg) &&
           isFreeReg(OtherReg) && isSameAddressable(SavedReg, OtherReg) &&
-          isDeadInCaller(OtherReg)) {
+          isDeadInCaller(OtherReg, TheCaller, RegInfo)) {
         // Rename the register and all its sub-registers.
         MFRegInfo.replaceRegWith(SavedReg, OtherReg);
 
@@ -309,7 +296,7 @@ DiscardSaving:
 /// lib/CodeGen/PrologueEpilogueInserter.cpp
 void CallSpillEli::findSaveRestoreBBs(
     MachineFunction &MF, SmallVectorImpl<MachineBasicBlock *> &SaveBBs,
-    SmallVectorImpl<MachineBasicBlock *> &RestoreBBs) const {
+    SmallVectorImpl<MachineBasicBlock *> &RestoreBBs) {
   SaveBBs.clear();
   RestoreBBs.clear();
   const MachineFrameInfo *MFI = MF.getFrameInfo();
@@ -344,7 +331,7 @@ void CallSpillEli::findSaveRestoreBBs(
 void CallSpillEli::findCSInstrs(
     MachineFunction &MF, const SmallVectorImpl<MachineBasicBlock *> &SaveBBs,
     const SmallVectorImpl<MachineBasicBlock *> &RestoreBBs,
-    vector<CalleeSavedInstr> &CSInstrs) const {
+    vector<CalleeSavedInstr> &CSInstrs) {
   MachineFrameInfo &MFI = *MF.getFrameInfo();
 
   SmallVector<MachineBasicBlock::iterator, 4> SaveBBIts(SaveBBs.size());
@@ -385,9 +372,9 @@ void CallSpillEli::findCSInstrs(
   }
 }
 
-bool CallSpillEli::findCallers(
-    const MachineFunction &MF, const MachineFunctionAnalysis &MFAnalysis,
-    SmallVectorImpl<const MachineInstr *> &Results) const {
+bool CallSpillEli::findCallers(const MachineFunction &MF,
+                               const MachineFunctionAnalysis &MFAnalysis,
+                               SmallVectorImpl<const MachineInstr *> &Results) {
   DenseSet<const Function *> Searched;
   const Function *F = MF.getFunction();
 
@@ -418,7 +405,7 @@ bool CallSpillEli::findCallers(
   return true;
 }
 
-void CallSpillEli::discardRegSave(CalleeSavedInstr &CSI) const {
+void CallSpillEli::discardRegSave(CalleeSavedInstr &CSI) {
   ++NumSpillEliminated;
 
   for (auto &PushPops : { CSI.PushInstrs, CSI.PopInstrs }) {
@@ -433,8 +420,12 @@ void CallSpillEli::discardRegSave(CalleeSavedInstr &CSI) const {
   }
 }
 
-bool CallSpillEli::isCalleeSavedReg(const MachineFunction &MF,
-                                    unsigned Reg) const {
+bool CallSpillEli::isCalleeSavedReg(const MachineFunction &MF, unsigned Reg) {
+  static struct {
+    const MCPhysReg *Ptr;
+    SparseSet<unsigned> Regs;
+  } CalleeSavedRegsCache;
+
   const TargetRegisterInfo *RegInfo = MF.getRegInfo().getTargetRegisterInfo();
   const MCPhysReg *Ptr = RegInfo->getCalleeSavedRegs(&MF);
 
@@ -451,7 +442,79 @@ bool CallSpillEli::isCalleeSavedReg(const MachineFunction &MF,
   return CalleeSavedRegsCache.Regs.count(Reg);
 }
 
-bool CallSpillEli::hasNoCall(const MachineFunction &MF) const {
+/// The implementation is from MachineBasicBlock::computeRegisterLiveness
+/// defined in lib/CodeGen/MachineBasicBlock.cpp. However, the implementation
+/// here does not use the live-in information of each machine basic block.
+/// It performs linear search on previous and next few instructions of the
+/// specified instruction, so there is chance to get uncertain replies (false).
+/// Adjust the command line option "LivenessCheckDepth" to give more chance to
+/// find dead registers.
+bool CallSpillEli::isDeadInCaller(unsigned Reg, const MachineInstr *Before,
+                                  const TargetRegisterInfo *TRI) {
+  if (Before->getOperand(1).clobbersPhysReg(Reg))
+    return true;
+
+  unsigned N = LivenessCheckDepth;
+  const MachineBasicBlock *MBB = Before->getParent();
+
+  // Start by searching backwards from Before, looking for kills, reads or defs.
+  MachineBasicBlock::const_iterator I(Before);
+  // If this is the first insn in the block, don't search backwards.
+  if (I != MBB->begin()) {
+    do {
+      --I;
+
+      MachineOperandIteratorBase::PhysRegInfo Info =
+          ConstMIOperands(*I).analyzePhysReg(Reg, TRI);
+
+      // Defs happen after uses so they take precedence if both are present.
+
+      // Register is dead after a dead def of the full register.
+      if (Info.DeadDef)
+        return true;
+      // Register is (at least partially) live after a def.
+      if (Info.Defined) {
+        if (!Info.PartialDeadDef)
+          return false;
+        // As soon as we saw a partial definition (dead or not),
+        // we cannot tell if the value is partial live without
+        // tracking the lanemasks. We are not going to do this,
+        // so fall back on the remaining of the analysis.
+        break;
+      }
+      // Register is dead after a full kill or clobber and no def.
+      if (Info.Killed || Info.Clobbered)
+        return true;
+      // Register must be live if we read it.
+      if (Info.Read)
+        return false;
+    } while (I != MBB->begin() && --N > 0);
+  }
+
+  N = LivenessCheckDepth;
+
+  // Try searching forwards from Before, looking for reads or defs.
+  I = MachineBasicBlock::const_iterator(Before);
+  // If this is the last insn in the block, don't search forwards.
+  if (I != MBB->end()) {
+    for (++I; I != MBB->end() && N > 0; ++I, --N) {
+      MachineOperandIteratorBase::PhysRegInfo Info =
+          ConstMIOperands(*I).analyzePhysReg(Reg, TRI);
+
+      // Register is live when we read it here.
+      if (Info.Read)
+        return false;
+      // Register is dead if we can fully overwrite or clobber it here.
+      if (Info.FullyDefined || Info.Clobbered)
+        return true;
+    }
+  }
+
+  // At this point we have no idea of the liveness of the register.
+  return false;
+}
+
+bool CallSpillEli::hasNoCall(const MachineFunction &MF) {
   for (const MachineBasicBlock &MBB : MF) {
     for (const MachineInstr &MI : MBB) {
       if (MI.isCall())
