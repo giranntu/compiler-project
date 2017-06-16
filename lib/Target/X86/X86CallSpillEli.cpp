@@ -108,6 +108,10 @@ private:
   bool isDeadInCaller(unsigned Reg, const MachineInstr *Caller,
                       const TargetRegisterInfo *) const;
 
+  /// To get a set of available registers that are all dead in all callers of
+  /// the specified machine function.
+  SparseSet<unsigned> &findDeadRegsInAllCallers(const MachineFunction &) const;
+
   /// Check wheter the specified function does not call any children
   /// function.
   static bool hasNoCall(const MachineFunction &);
@@ -123,6 +127,11 @@ private:
     bool Valid = false;
     const MachineFunction *Of;
   } CallersOfMF;
+
+  mutable struct {
+    SparseSet<unsigned> DeadInAllCallers;
+    const MachineFunction *Of;
+  } DeadInAllCallersOf;
 };
 
 char FunctionReorderPass::ID = 0;
@@ -163,32 +172,12 @@ bool CallSpillEli::runOnMachineFunction(MachineFunction &MF) {
 /// RegInfoCollector). The information is collected after all things finished.
 #define RETURN(Val) updateDeadRegs(MF); return Val
 
-  const Function *F = MF.getFunction();
-
   auto FunctionAbort = [&](StringRef Reason) {
     DEBUG(dbgs() << "[X] Function aborted: " << MF.getName() << "\n" << Reason);
   };
   auto FunctionProcessed = [&]() {
     DEBUG(dbgs() << "[V] Function processed: " << MF.getName() << "\n");
   };
-
-  // Require callers of the function to be determinable, and abort if not.
-  // Thatis, it cannot have either external linkage (may be called from
-  // other modules) or address taken (may be called indirectly).
-  if (F->hasAddressTaken() || !F->hasLocalLinkage()) {
-    FunctionAbort("\tIt is not trackable because either it has external\n"
-                  "\tlinkage or it might be called indirectly (it has its\n"
-                  "\taddress taken). \n");
-    RETURN(false);
-  }
-
-  // Require the function to has only one caller. Currently abort if not.
-  // TODO: It shall be able to analysis register usage of all callers.
-  if (F->getNumUses() != 1) {
-    FunctionAbort("\tIt has either zero or more than one callers, which\n"
-                  "\tis currently not supported. \n");
-    RETURN(false);
-  }
 
   // Find all callers to this MachineFunction.
   // Require all callers' register allocation to be done. Abort if not.
@@ -214,7 +203,6 @@ bool CallSpillEli::runOnMachineFunction(MachineFunction &MF) {
 
   // TODO: Currently it only supports one caller. However, following code
   // need modification to support multiple callers.
-  const MachineInstr *TheCaller = Callers.front();
   MachineRegisterInfo &MFRegInfo = MF.getRegInfo();
   const TargetRegisterInfo *RegInfo = MFRegInfo.getTargetRegisterInfo();
 
@@ -226,6 +214,11 @@ bool CallSpillEli::runOnMachineFunction(MachineFunction &MF) {
   DEBUG(dbgs() << "\t[V] Register saving discarded: <"                         \
                << RegInfo->getName(Reg) << ">\n"                               \
                << Reason);
+
+  SparseSet<unsigned> &DeadRegsInAllCallers = findDeadRegsInAllCallers(MF);
+  auto isDeadInAllCallers = [&](unsigned Reg) -> bool {
+    return DeadRegsInAllCallers.count(Reg);
+  };
 
   // To check if two registers have same addressed ability. For example,
   // <RAX> can be addressed by <RAX>, <EAX>, <AX>, <AH>, <AL>, but
@@ -257,7 +250,7 @@ bool CallSpillEli::runOnMachineFunction(MachineFunction &MF) {
 
     // If SavedReg is originally dead in the caller, there is no longer need
     // to save it.
-    if (isDeadInCaller(SavedReg, TheCaller, RegInfo)) {
+    if (isDeadInAllCallers(SavedReg)) {
       RegEliSuccessed(SavedReg, "\t\tIt is originally dead in the caller.\n");
       goto DiscardSaving;
     }
@@ -271,7 +264,7 @@ bool CallSpillEli::runOnMachineFunction(MachineFunction &MF) {
       if (!MFRegInfo.isReserved(OtherReg) && wontBeClobbered(OtherReg) &&
           isFreeReg(OtherReg, MFRegInfo) &&
           isSameAddressable(SavedReg, OtherReg) &&
-          isDeadInCaller(OtherReg, TheCaller, RegInfo)) {
+          isDeadInAllCallers(OtherReg)) {
         // Rename the register and all its sub-registers.
         MFRegInfo.replaceRegWith(SavedReg, OtherReg);
 
@@ -568,6 +561,53 @@ bool CallSpillEli::isDeadInCaller(unsigned Reg, const MachineInstr *Before,
   return false;
 }
 
+SparseSet<unsigned> &
+CallSpillEli::findDeadRegsInAllCallers(const MachineFunction &MF) const {
+  if (DeadInAllCallersOf.Of != &MF) {
+    DeadInAllCallersOf.Of = &MF;
+    SparseSet<unsigned> &AllDeads = DeadInAllCallersOf.DeadInAllCallers;
+
+    const Function *F = MF.getFunction();
+    const MachineRegisterInfo &MRegInfo = MF.getRegInfo();
+    const TargetRegisterInfo &TRegInfo = *MRegInfo.getTargetRegisterInfo();
+
+    AllDeads.clear();
+    AllDeads.setUniverse(TRegInfo.getNumRegs() + 1);
+
+    // There is an assumed starting point.
+    if (NoCSRInRun && MF.getName() == "run") {
+      const MCPhysReg *CSR = TRegInfo.getCalleeSavedRegs(&MF);
+      while (*CSR) {
+        AllDeads.insert(*(CSR++));
+      }
+
+    // If callers of this function are not trackable, all registers may be
+    // alive.
+    } else if (F->hasLocalLinkage() && !F->hasAddressTaken()) {
+      SmallVector<const MachineInstr *, 8> CallerInsts;
+
+      if (findCallers(MF, CallerInsts)) {
+        const MCPhysReg *CSR = TRegInfo.getCalleeSavedRegs(&MF);
+        while (*CSR) {
+          auto dead = [&](const MachineInstr *Caller) {
+            return isDeadInCaller(*CSR, Caller, &TRegInfo);
+          };
+
+          // This register is dead in all callers, so it is also dead in the
+          // entry of this function.
+          if (all_of(CallerInsts, dead)) {
+            AllDeads.insert(*CSR);
+          }
+
+          ++CSR;
+        }
+      }
+    }
+  }
+
+  return DeadInAllCallersOf.DeadInAllCallers;
+}
+
 bool CallSpillEli::hasNoCall(const MachineFunction &MF) {
   for (const MachineBasicBlock &MBB : MF) {
     for (const MachineInstr &MI : MBB) {
@@ -582,49 +622,16 @@ bool CallSpillEli::hasNoCall(const MachineFunction &MF) {
 /// It first tracks possible dead registers by finding the interaction of dead
 /// registers of all callers. Then, exclude those used in this function.
 void CallSpillEli::updateDeadRegs(const MachineFunction &MF) {
-  SparseSet<unsigned> InitialDeadRegs;
   const Function *F = MF.getFunction();
   const MachineRegisterInfo &MRegInfo = MF.getRegInfo();
   const TargetRegisterInfo &TRegInfo = *MRegInfo.getTargetRegisterInfo();
-
-  InitialDeadRegs.setUniverse(TRegInfo.getNumRegs() + 1);
-
-  // There is an assumed starting point.
-  if (NoCSRInRun && MF.getName() == "run") {
-    const MCPhysReg *CSR = TRegInfo.getCalleeSavedRegs(&MF);
-    while (*CSR) {
-      InitialDeadRegs.insert(*(CSR++));
-    }
-
-  // If callers of this function are not trackable, all registers may be
-  // alive.
-  } else if (F->hasLocalLinkage() && !F->hasAddressTaken()) {
-    SmallVector<const MachineInstr *, 8> CallerInsts;
-
-    if (findCallers(MF, CallerInsts)) {
-      const MCPhysReg *CSR = TRegInfo.getCalleeSavedRegs(&MF);
-      while (*CSR) {
-        auto dead = [&](const MachineInstr *Caller) {
-          return isDeadInCaller(*CSR, Caller, &TRegInfo);
-        };
-
-        // This register is dead in all callers, so it is also dead in the entry
-        // of this function.
-        if (all_of(CallerInsts, dead)) {
-          InitialDeadRegs.insert(*CSR);
-        }
-
-        ++CSR;
-      }
-    }
-  }
 
   SparseSet<unsigned> &FinalDeadRegs =
       *(FnDeadRegs[F] = new SparseSet<unsigned>);
   FinalDeadRegs.setUniverse(TRegInfo.getNumRegs() + 1);
 
   // Exclude registers used in this function.
-  for (unsigned Reg : InitialDeadRegs) {
+  for (unsigned Reg : findDeadRegsInAllCallers(MF)) {
     if (isFreeReg(Reg, MRegInfo))
       FinalDeadRegs.insert(Reg);
   }
