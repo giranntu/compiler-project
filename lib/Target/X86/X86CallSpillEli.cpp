@@ -347,10 +347,17 @@ void CallSpillEli::findCSInstrs(
     vector<CalleeSavedInstr> &CSInstrs) {
   MachineFrameInfo &MFI = *MF.getFrameInfo();
 
-  SmallVector<MachineBasicBlock::iterator, 4> SaveBBIts(SaveBBs.size());
-  SmallVector<MachineBasicBlock::reverse_iterator, 4> RestoreBBIts(RestoreBBs.size());
-  transform(SaveBBs, SaveBBIts.begin(), [](MachineBasicBlock *MBB) { return MBB->begin(); });
-  transform(RestoreBBs, RestoreBBIts.begin(), [](MachineBasicBlock *MBB) { return MBB->rbegin(); });
+  using BBIt = MachineBasicBlock::iterator;
+  using BBRIt = MachineBasicBlock::reverse_iterator;
+
+  SmallVector<pair<BBIt, BBIt>, 4> SaveBBIts(SaveBBs.size());
+  SmallVector<pair<BBRIt, BBRIt>, 4> RestoreBBIts(RestoreBBs.size());
+  transform(SaveBBs, SaveBBIts.begin(), [](MachineBasicBlock *MBB) {
+    return make_pair(MBB->begin(), MBB->end());
+  });
+  transform(RestoreBBs, RestoreBBIts.begin(), [](MachineBasicBlock *MBB) {
+    return make_pair(MBB->rbegin(), MBB->rend());
+  });
 
   vector<CalleeSavedInfo> CSIs(MFI.getCalleeSavedInfo());
   sort(CSIs.begin(), CSIs.end(), [&](const CalleeSavedInfo &lhs, const CalleeSavedInfo &rhs) {
@@ -362,20 +369,34 @@ void CallSpillEli::findCSInstrs(
     CalleeSavedInstr CSInstr {CSI};
 
     // Find pushes in prologues.
-    for (auto &SaveBBIt : SaveBBIts) {
-      while (SaveBBIt->getOpcode() != X86::PUSH64r ||
-             SaveBBIt->getOperand(0).getReg() != CSI.getReg()) {
+    for (auto &SaveBBItPair : SaveBBIts) {
+      BBIt &SaveBBIt = SaveBBItPair.first;
+      BBIt SaveBBEnd = SaveBBItPair.second;
+      while (SaveBBIt != SaveBBEnd &&
+             (SaveBBIt->getOpcode() != X86::PUSH64r ||
+              SaveBBIt->getOperand(0).getReg() != CSI.getReg())) {
         ++SaveBBIt;
+      }
+
+      if (SaveBBIt == SaveBBEnd) {
+        goto BlockError;
       }
       assert(SaveBBIt->getFlag(MachineInstr::FrameSetup));
       CSInstr.PushInstrs.push_back(&*SaveBBIt);
     }
 
     // Find pops in epilogues.
-    for (auto &RestoreBBIt : RestoreBBIts) {
-      while (RestoreBBIt->getOpcode() != X86::POP64r ||
-             RestoreBBIt->getOperand(0).getReg() != CSI.getReg()) {
+    for (auto &RestoreBBItPair : RestoreBBIts) {
+      BBRIt &RestoreBBIt = RestoreBBItPair.first;
+      BBRIt RestoreBBEnd = RestoreBBItPair.second;
+      while (RestoreBBIt != RestoreBBEnd &&
+             (RestoreBBIt->getOpcode() != X86::POP64r ||
+              RestoreBBIt->getOperand(0).getReg() != CSI.getReg())) {
         ++RestoreBBIt;
+      }
+
+      if (RestoreBBIt == RestoreBBEnd) {
+        goto BlockError;
       }
       assert(RestoreBBIt->getFlag(MachineInstr::FrameDestroy));
       CSInstr.PopInstrs.push_back(&*RestoreBBIt);
@@ -383,6 +404,9 @@ void CallSpillEli::findCSInstrs(
 
     CSInstrs.emplace_back(move(CSInstr));
   }
+
+BlockError:
+  CSInstrs.clear();
 }
 
 bool CallSpillEli::findCallers(
