@@ -402,7 +402,7 @@ bool CallSpillEli::findCallers(
 
   transform(F->users(), CallerMFs.begin(), [&](const User *U) {
     const Function *F = cast<Instruction>(U)->getFunction();
-    return FnDeadRegs.count(F) ? MFA.getMFOf(F) : nullptr;
+    return isa<CallInst>(U) && FnDeadRegs.count(F) ? MFA.getMFOf(F) : nullptr;
   });
   if (count(CallerMFs.begin(), CallerMFs.end(), nullptr)) {
     CallersOfMF.Valid = false;
