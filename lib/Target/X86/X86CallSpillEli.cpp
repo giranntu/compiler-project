@@ -401,7 +401,8 @@ bool CallSpillEli::findCallers(
   SmallVector<const MachineFunction *, 8> CallerMFs(F->getNumUses());
 
   transform(F->users(), CallerMFs.begin(), [&](const User *U) {
-    return MFA.getMFOf(cast<Instruction>(U)->getFunction());
+    const Function *F = cast<Instruction>(U)->getFunction();
+    return FnDeadRegs.count(F) ? MFA.getMFOf(F) : nullptr;
   });
   if (count(CallerMFs.begin(), CallerMFs.end(), nullptr)) {
     CallersOfMF.Valid = false;
