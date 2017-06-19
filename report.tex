@@ -1,0 +1,262 @@
+\documentclass[acmsmall]{acmart}
+
+\usepackage[inline]{enumitem}
+\usepackage{listings}
+\usepackage{hyperref}
+\usepackage{array}
+
+\definecolor{mygreen}{rgb}{0,0.6,0}
+\definecolor{mygray}{rgb}{0.5,0.5,0.5}
+\definecolor{mymauve}{rgb}{0.58,0,0.82}
+
+\lstset{ %
+	backgroundcolor=\color{white},   % choose the background color; you must add \usepackage{color} or \usepackage{xcolor}; should come as last argument
+	basicstyle=\footnotesize\ttfamily,        % the size of the fonts that are used for the code
+	breakatwhitespace=false,         % sets if automatic breaks should only happen at whitespace
+	breaklines=true,                 % sets automatic line breaking
+	captionpos=b,                    % sets the caption-position to bottom
+	commentstyle=\color{mygreen},    % comment style
+	deletekeywords={in, for, function, true, false}, % if you want to delete keywords from the given language
+	escapeinside={\%*}{*)},          % if you want to add LaTeX within your code
+	extendedchars=true,              % lets you use non-ASCII characters; for 8-bits encodings only, does not work with UTF-8
+	keepspaces=true,                 % keeps spaces in text, useful for keeping indentation of code (possibly needs columns=flexible)
+	keywordstyle=\color{blue},       % keyword style
+	morekeywords={mkdir, cmake, make, cd,...},     % if you want to add more keywords to the set
+	numbers=left,                    % where to put the line-numbers; possible values are (none, left, right)
+	numbersep=5pt,                   % how far the line-numbers are from the code
+	numberstyle=\tiny\color{mygray}, % the style that is used for the line-numbers
+	rulecolor=\color{black},         % if not set, the frame-color may be changed on line-breaks within not-black text (e.g. comments (green here))
+	stringstyle=\color{mymauve},     % string literal style
+}
+
+\hypersetup{
+	colorlinks=true,
+	urlcolor=blue
+}
+
+% Remove non-related stuff
+\setcopyright{none}
+\settopmatter{printacmref=false, printccs=false}
+\renewcommand\footnotetextcopyrightpermission[1]{}
+\fancypagestyle{firstpagestyle}{%
+	\fancyfoot{}
+	\fancyhead{}
+}
+\fancyhead[LE, RO]{\thepage}
+\fancyfoot{}
+
+\title{Redundant Register Saving Elimination for Procedure Calls}
+\subtitle{A Link-time Optimization using Cross-procedure Register Usage Analysis}
+
+\author{Chih-Yung Liang}
+\affiliation{
+	\institution{National Taiwan University}
+	\department{Institute of Networking and Multimedia}
+}
+\email{r05944012@csie.ntu.edu.tw}
+
+\author{Shih-Kai Lin}
+\affiliation{
+	\institution{National Taiwan University}
+	\department{Department of Computer Science and Information Engineering}
+}
+\email{r05922043@csie.ntu.edu.tw}
+
+\begin{abstract}
+	\begin{description}[labelwidth=2cm]
+		\item[Student ID 1] R05944012
+		\item[Student ID 2] R05922043
+		\item[Repository] \url{https://github.com/ntu-homeworks/compiler-project}
+	\end{description}
+\end{abstract}
+
+\begin{document}
+\maketitle
+
+\section{Introduction}
+Instruction Set Architectures (ISA) like \textit{X86} have limited number of general-purposed registers. Although it is more desired to store many kinds of values in registers than in the stack, \textit{register spills} happen whenever the amount of free registers becomes insufficient. Especially, lots of registers are spilled on function call instructions to follow the calling convention. As what calling conventions define, if a register is categorized as preserved, it is expected to retain the original value after a function call. That is, the callee has to save/restore such registers in the function entry/exiting point if they are used. On the other hand, if a register is non-preserved, it is not guaranteed to keep the original value after a function call. The caller is responsible to save the register before the call.
+
+To reduce the number of spills, several complex algorithms performing global (inter-basic-block) register allocation are proposed and implemented on modern compilers. However, the register allocation is usually limited within the scope of a function because of the tremendous increased complexity and the separation compilation. Although sometimes the amount of register is actually sufficient to not spill, redundant save/store instructions are still inserted into functions to follow the calling convention.
+
+This project, as a link-time optimization, utilizes cross-procedure register usage analysis to eliminate register saves and restores. Briefly, the strategy is that a callee-saved (preserved) register used in a function is no longer saved if it is sure to be originally dead (that is, the value in that register can be discarded) in all possible callers. In advance, the optimizer also tries to rename a register to another one fulfilling that strategy to eliminate the saving. Built on LLVM, the project is specific to the X86 backend to prove the concept.
+
+\section{Strategies}
+\label{sec:strategy}
+There are many strategies decided during the development of this project to achieve the best effect, including the calling convention, function processing order, register liveness detection, and register reassignment. This section describes these strategies in detail.
+
+\subsection{Calling Convention}
+\label{subsec:call-convention}
+To simplify the implementation of this project, a calling convention for preserved register set is defined for the code compiled by this project:
+\[
+\begin{cases}
+	& \text{Preserved (callee-saved): } rbx, rbp, r10, r11, r12, r13, r14, r15 \\
+	& \text{Non-preserved (caller-saved): } rax, rcx, rdx, rsi, rdi, r8, r9 \\
+\end{cases}
+\]
+This calling convention minimizes the non-preserved register set to as much as possible prevent callers from saving registers. It results in that registers are mostly saved by the callee during each function call, so we can focus on eliminating register saving in callee. In detail, when processing a function, the optimizer analyzes the register status in all the function's callers and determines whether to remove some register saves.
+
+\subsection{Function Processing Order}
+\label{subsec:reorder}
+When compiling an LLVM module (a source file), LLVM emits each function one by one. To be more specific, until a function is completely emitted, the next function is not processed, including the register allocation. Since the optimization depends on register allocation results of all callers, it is desired that all callers are already processed before processing the callee. As a result, functions in a module are reordered to the depth-first traversing sequence of the call graph of that module.
+
+\subsection{Register Liveness Detection}
+\label{subsec:liveness}
+A register is dead if the value stored in it is no long used. If a callee-saved register is found dead in all possible callers, saving that register becomes redundant and can be discarded. However, it is not necessary that a function can always find the register allocation information of all its callers. It must match all these conditions:
+\begin{enumerate}
+	\item The function does not have external linkage. Even this optimization is performed in link-time, a function with external linkage is still possible called by unknown callers.
+	\item The function does not have address taken. The function may be called indirectly through function pointers.
+	\item \label{item:caller-order} All callers have their register allocation done.
+\end{enumerate}
+In fact, as the optimizer reorders functions in the processed module (mentioned in \ref{subsec:reorder}), condition (\ref{item:caller-order}) is very likely to fulfill. On the other hand, there is an optional experimental exception that all registers are dead before entering the function "\textit{run}", although this function does not satisfy all three conditions.
+
+There are two approaches implemented in this project to find out whether a specified register is dead in a specified caller. Both approaches may have uncertain answer to the liveness of the register, but either one of these approaches can confirm that the register is dead. In addition, if the register is confirmed dead in all callers, it is a dead register that does not require saving. However, to ensure the correctness, the optimizer has to be conservative that a register is seen as alive if both approaches make uncertain answers.
+
+\subsubsection{Linear Liveness Searching}
+\label{subsubsec:linear-search}
+This approach searches instructions in the basic block the caller lives. Starting from the call instruction, it performs a backward search followed by a forward search on number of instructions to realize the register liveness. The searches are stopped if there comes a certain answer. The backward search can tell a register is
+\begin{description}
+	\item[alive] if the register is just defined or read, and the definition is not dead, or
+	\item[dead] if the register is killed, clobbered, or has a dead definition.
+\end{description}
+On the other hand, the forward search can tell a register is
+\begin{description}
+	\item[alive] if the register is read, or
+	\item[dead] if the register is clobbered or fully redefined.
+\end{description}
+If there is still no a certain answer after performing these searches, this approach cannot reply an effective answer.
+
+\subsubsection{Dead Register Table}
+\label{subsubsec:dead-table}
+This approach maintains a table recording dead register sets of each function. The optimizer can realize if a register must be dead in some callers by looking up this table. To build the table, for each function the optimizer processes, it retrieves the dead register sets of all callers by looking up this table and using the approach mentioned in \ref{subsubsec:linear-search}. The intersection of these sets is the initial dead register set of the function. Then, the initial set is subtracted with all registers the function touches to produce the final result set, which contains registers that must be dead in the whole function. Finally, the table is updated with the information of the dead register set of this function. Notice that due to the exception of the function "\textit{run}", the initial dead register set of "\textit{run}" contains all registers on the machine.
+
+\subsection{Register Reassignment}
+Saves and restores of a register in a function cannot be discarded if the register is not sured to be dead in all possible callers of the function. However, through register renaming, the optimizer may find that the newly assigned register is known to be dead in all possible callers. Thus, the optimizer will try to rename each register whose saves and stores cannot be eliminated, including its sub-registers. To rename a register, besides to make sure the new assignment is dead in all callers (in order to be profitable), there are several constraints to meet to make the renaming legal:
+\begin{itemize}
+	\item The new assignment is not reserved (e.g. \textit{RSP}, \textit{RIP}, and sometimes \textit{RBP}).
+	\item The new assignment will not be clobbered during a function call. That is, either it is a preserved (callee-saved) register or the function does not contains any function call instruction.
+	\item The new assignment is originally free in the function. That is, neither itself nor its sub-registers is referenced in the function.
+	\item The new assignment can be referenced by instructions in the function in the same way the original assignment does. For example, in case the register \textit{RBX} is accessed by some instructions through \textit{AH}, it cannot be renamed to \textit{R12}, which cannot be addressed like that.
+\end{itemize}
+
+
+\section{Implementation Detail}
+This project directly modifies the source code of LLVM, and there are two additional LLVM passes inserted into the process LLVM emits machine/assembly code for a module. The first pass, \textit{TopDownFunctionReorderPass}, is a module pass, which performs Intermediate Representation (IR) transformation, and is inserted into the code generation preparation stage. The other pass, \textit{X86CallSpillEliPass}, is a machine function pass, which performs machine IR transformation, and is inserted into the pre-emit stage.
+
+\subsection{TopDownFunctionReorderPass}
+This pass reorders functions in the processed module according to the depth-first traversal sequence of the call graph to achieve the strategy mentioned in \ref{subsec:reorder}.
+
+\subsection{X86CallSpillEliPass}
+There is two jobs this pass does:
+\begin{enumerate*}
+	\item To build the dead register table, which is mentioned in \ref{subsubsec:dead-table}.
+	\item To eliminate register saves and restores in function entry and exiting points.
+\end{enumerate*}
+The first job is always performed at the last stage of the pass, even the second job has failed. All the implementation of this pass follow strategies mentioned in Section~\ref{sec:strategy}. However, there are still some technical problems to issue.
+
+\subsubsection{Caller Finding}
+The machine instruction calling the function being processed is actually difficult to find as there aren't one-on-one mappings from IR instructions to machine instructions. However, after modifying \textit{MachineFunctionAnalysis}, IR functions and machine functions are one-on-one mapped, so the actually caller machine instruction can now be found by searching from the machine function mapped from the IR function the caller IR instruction lies in.
+
+\subsubsection{Register Saves/Restores Instruction Finding}
+Register save instructions are always in the function entry point, and restore instructions are always in the function exiting points. However, while the entry point of the function is always the first basic block of the function, the exiting points of the function are relatively difficult to find. Moreover, there may be multiple exiting points. To find exiting blocks of the function, the optimizer can only search for possibly-return blocks between all basic blocks in the function.
+
+\section{Usage}
+This section describes how to build and test the project.
+
+\subsection{Building}
+\begin{lstlisting}
+$ git clone --depth 1 https://github.com/ntu-homeworks/compiler-project.git
+$ mkdir build && cd build
+$ cmake -DCMAKE_BUILD_TYPE=Release -DLLVM_ENABLE_ASSERTIONS=On \
+        -DLLVM_TARGETS_TO_BUILD=X86 ../compiler-project
+$ make llc
+\end{lstlisting}
+
+\subsection{Testing \textit{llc}}
+For the fairness, please test the baseline using the same \textit{llc} to apply same calling convention to compare the result! Also, mixing code with different calling convention (e.g. calling a library function like \textit{printf}) can cause error!
+
+\begin{lstlisting}
+llc [-x86-call-spill-eli \
+		[-eli-call-spill-depth=<Liveness Check Depth>] \
+		[-no-livein-run=<true|false>] \
+		[-debug -debug-only=x86-eliminate-call-spill] \
+		[-stats] \
+    ]
+
+-x86-call-spill-eli          Turn on the optimizer. Default is off.
+-eli-call-spill-depth=       The number of instructions to search in the method 
+                             mentioned in %*\ref{subsubsec:linear-search}*). Default is 10.
+-no-livein-run=<true|false>  To use the experimental exception for function 
+                             "%*\textit{run}*)" mentioned in %*\ref{subsec:liveness}*). Default is on.
+-debug                       To dump debug information.
+-stats                       To dump statistical results.
+\end{lstlisting}
+
+\section{Evaluation}
+We only apply our optimizer on the module being tested, where the module contains a procedure "\textit{run}" as the entry point. This module is compiled into LLVM IR using \textit{Clang 3.9} with flags including \texttt{-emit-llvm}. Then, the module is optimized in IR level with \textit{opt 3.9} flagged by \texttt{-O3}. After that, the machine code of this module can be emitted by our modified \textit{llc 3.9}. Finally, the emitted module is linked with the wrapper used to test that module. Since the wrapper is compiled with unmodified compiler, it may have different calling convention with the tested module. Thus, there is a calling convention protector included in the wrapper. On the other hand, to evaluate the optimization result, besides statistical numbers dumped by our optimizer, we use \textit{Pin Tool} to count instructions executed in each function of the tested module.
+
+\subsection{Test Cases}
+We have tested the project with four test cases, which are either used to test the correctness ot used to test the ability to eliminate redundant spills:
+\begin{description}[labelwidth=4cm]
+	\item[For elimination ability]
+	\begin{enumerate*}
+		\item \textit{Simple} (the example test case).
+	\end{enumerate*}
+	\item[For correctness]
+	\begin{enumerate*}
+		\item \textit{Recursive},
+		\item \textit{Indirect}, and
+		\item \textit{ExternalCall}.
+	\end{enumerate*}
+\end{description}
+The test case \textit{Recursive} test if the optimizer can correctly handle recursive function call; that is, the register spills in such functions cannot be eliminated. The test case \textit{Indirect} tests if the optimizer accidentally eliminates spills in functions being called indirectly. The test case \textit{ExternalCall} tests if the optimizer accidentally eliminates spills in exported functions. Table~\ref{tab:output} shows the supposed output of each test case.
+
+\subsection{Statistical Results}
+Table~\ref{tab:stats} demonstrates our optimizer result in
+\begin{enumerate*}
+	\item number of register spills eliminated,
+	\item number of registers renamed in callee, and
+	\item number of instructions removed.
+\end{enumerate*}
+We also show the instruction count measured in runtime for each test case before and after the optimization. Columns about \textit{Instr. Count} in Table~\ref{tab:stats} are the total numbers of instructions executed by the function \textit{run} and all its children, recursively. Notice that the data about the original instruction count is also under the calling convention we apply, which is mentioned in~\ref{subsec:call-convention}.
+
+\begin{table}[t]
+	\caption{Example Output of Test Cases}
+	\label{tab:output}
+	\centering
+	\begin{tabular}{|l|r|}
+		\hline
+		Test Case & Output \\
+		\hline
+		\textit{Simple} & -553,279,039 \\
+		\hline
+		\textit{Recursive} & 1,484,417,395 \\
+		\hline
+		\textit{Indirect} & -587,190,255 \\
+		\hline
+		\textit{ExternalCall} & -483,017,440 \\
+		\hline
+	\end{tabular}
+	\bigskip
+
+\end{table}
+
+\begin{table}[t]
+	\caption{Statistical Result of the Optimizer}
+	\label{tab:stats}
+	\centering
+	\begin{tabular}{l||r|r|r||r|r|r}
+		& \multicolumn{3}{c||}{Result in Emitted Code} & \multicolumn{3}{c}{Measured in Runtime} \\
+		\hline
+		Test Case & \multicolumn{1}{p{1.45cm}|}{\centering Eliminated Spills} & \multicolumn{1}{p{1.45cm}|}{\centering Renamed Registers} & \multicolumn{1}{p{1.45cm}||}{\centering Removed Instrs.} & \multicolumn{1}{p{1.67cm}|}{\centering Original Instr. Count} & \multicolumn{1}{p{1.67cm}|}{\centering Optimized Instr. Count} & \multicolumn{1}{p{1.67cm}}{\centering Reduced Instr. Count} \\
+		\hline
+		\textit{Simple} & 7 & 4 & 14 & 4,800,012 & 3,800,008 & 20.8\% \\
+		\hline
+		\textit{Recursive} & 4 & 1 & 8 & 2,100,042 & 1,700,038 & 19\% \\
+		\hline
+		\textit{Indirect} & 4 & 1 & 8 & 4,300,013 & 3,900,009 & 9.3\% \\
+		\hline
+		\textit{ExternalCall} & 0 & 0 & 0 & 40,000,012 & 40,000,012 & 0\% \\
+	\end{tabular}
+\end{table}
+
+\end{document}
